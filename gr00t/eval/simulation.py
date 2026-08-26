@@ -51,6 +51,8 @@ class VideoConfig:
     codec: str = "h264"
     input_pix_fmt: str = "rgb24"
     crf: int = 22
+    # Keep the original evaluator setting for compatibility with existing
+    # RoboCasa videos. Frames are copied before encoding in the wrapper.
     thread_type: str = "FRAME"
     thread_count: int = 1
 

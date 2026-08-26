@@ -14,10 +14,10 @@
 # limitations under the License.
 
 import os
+import subprocess
 import uuid
 from pathlib import Path
 
-import av
 import gymnasium as gym
 import numpy as np
 
@@ -81,8 +81,9 @@ class VideoRecorder:
         self._reset_state()
 
     def _reset_state(self):
-        self.container = None
-        self.stream = None
+        self.process = None
+        self.file_path = None
+        self.started = False
         self.shape = None
         self.dtype = None
         self.start_time = None
@@ -104,7 +105,7 @@ class VideoRecorder:
             codec=codec,
             input_pix_fmt=input_pix_fmt,
             pix_fmt=output_pix_fmt,
-            options={"crf": str(crf), "profile:v": "high"},
+            options={"crf": str(crf), "profile:v": str(profile)},
             **kwargs,
         )
         return obj
@@ -113,24 +114,69 @@ class VideoRecorder:
         self.stop()
 
     def is_ready(self):
-        return self.stream is not None
+        return self.started
 
     def start(self, file_path, start_time=None):
         if self.is_ready():
             # if still recording, stop first and start anew.
             self.stop()
 
-        self.container = av.open(file_path, mode="w")
-        self.stream = self.container.add_stream(self.codec, rate=self.fps)
-        codec_context = self.stream.codec_context
-        for k, v in self.kwargs.items():
-            setattr(codec_context, k, v)
+        self.file_path = str(file_path)
+        self.started = True
         self.start_time = start_time
+
+    def _start_ffmpeg(self):
+        if self.shape is None or self.file_path is None:
+            raise RuntimeError("A frame is required before starting ffmpeg.")
+        height, width, channels = self.shape
+        if channels != 3:
+            raise ValueError(f"Expected RGB frames with 3 channels, got {self.shape}")
+
+        options = self.kwargs.get("options", {})
+        crf = str(options.get("crf", 18))
+        profile = str(options.get("profile:v", "high"))
+        codec = "libx264" if self.codec == "h264" else self.codec
+        command = [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            self.input_pix_fmt,
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            str(self.fps),
+            "-i",
+            "-",
+            "-an",
+            "-c:v",
+            codec,
+            "-crf",
+            crf,
+            "-profile:v",
+            profile,
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            self.file_path,
+        ]
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
 
     def write_frame(self, img: np.ndarray, frame_time=None):
         if not self.is_ready():
             raise RuntimeError("Must run start() before writing!")
 
+        # Detach the MuJoCo render buffer and pass immutable bytes to ffmpeg.
+        img = np.array(img, copy=True, order="C")
         n_repeats = 1
         if self.start_time is not None:
             local_idxs, global_idxs, self.next_global_idx = get_accumulate_timestamp_idxs(
@@ -146,27 +192,35 @@ class VideoRecorder:
         if self.shape is None:
             self.shape = img.shape
             self.dtype = img.dtype
-            h, w, c = img.shape
-            self.stream.width = w
-            self.stream.height = h
         assert img.shape == self.shape
         assert img.dtype == self.dtype
 
-        frame = av.VideoFrame.from_ndarray(img, format=self.input_pix_fmt)
+        if self.process is None:
+            self._start_ffmpeg()
+        if self.process.stdin is None:
+            raise RuntimeError("ffmpeg stdin is not available.")
+        frame_bytes = img.tobytes(order="C")
         for i in range(n_repeats):
-            for packet in self.stream.encode(frame):
-                self.container.mux(packet)
+            self.process.stdin.write(frame_bytes)
 
     def stop(self):
-        if not self.is_ready():
+        if not self.started:
             return
 
-        # Flush stream
-        for packet in self.stream.encode():
-            self.container.mux(packet)
-
-        # Close the file
-        self.container.close()
+        error_text = ""
+        if self.process is not None:
+            if self.process.stdin is not None:
+                self.process.stdin.close()
+            return_code = self.process.wait()
+            error_text = (
+                self.process.stderr.read().decode("utf-8", errors="replace")
+                if self.process.stderr is not None
+                else ""
+            )
+            if return_code != 0:
+                raise RuntimeError(
+                    f"ffmpeg video encoding failed with code {return_code}: {error_text}"
+                )
 
         # reset runtime parameters
         self._reset_state()
@@ -226,7 +280,8 @@ class VideoRecordingWrapper(gym.Wrapper):
             if not self.video_recorder.is_ready():
                 self.video_recorder.start(self.file_path)
 
-            frame = self.env.render()
+            # Keep the frame independent from the wrapper's render cache.
+            frame = np.array(self.env.render(), copy=True, order="C")
             assert frame.dtype == np.uint8
             self.video_recorder.write_frame(frame)
             self.is_success = result[-1]["success"]
@@ -236,3 +291,8 @@ class VideoRecordingWrapper(gym.Wrapper):
         if self.video_recorder.is_ready():
             self.video_recorder.stop()
         return self.file_path
+
+    def close(self):
+        """Flush the active container before closing after an exception."""
+        self.video_recorder.stop()
+        return super().close()

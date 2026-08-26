@@ -28,6 +28,7 @@ from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.schema import DatasetMetadata
 from gr00t.data.transform.base import ComposedModalityTransform
 from gr00t.model.gr00t_n1 import GR00T_N1_5
+from gr00t.model.transforms import GR00TTransform, collate
 
 COMPUTE_DTYPE = torch.bfloat16
 
@@ -129,7 +130,31 @@ class Gr00tPolicy(BasePolicy):
             Dict[str, Any]: The transformed observation.
         """
         # Ensure correct dimensions before applying transforms
-        return self._modality_transform(obs)
+        transformed = self._modality_transform(obs)
+
+        # Dataset samples are normally collated by DefaultDataCollator before
+        # reaching the model. In single-environment inference, however, a
+        # transform can take the unbatched apply_single path and leave
+        # ``eagle_content.image_inputs`` as PIL images. GR00T_N1_5.prepare_input
+        # recursively moves every value to the device and therefore fails on
+        # those PIL objects. Collate that one sample here so inference has the
+        # same contract as training.
+        if "eagle_content" in transformed:
+            model_transform = next(
+                (
+                    item
+                    for item in self._modality_transform.transforms
+                    if isinstance(item, GR00TTransform)
+                ),
+                None,
+            )
+            if model_transform is None:
+                raise ValueError(
+                    "Transformed observation contains eagle_content, but no "
+                    "GR00TTransform was found to collate it."
+                )
+            transformed = collate([transformed], model_transform.eagle_processor)
+        return transformed
 
     def unapply_transforms(self, action: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -174,7 +199,11 @@ class Gr00tPolicy(BasePolicy):
 
         # Convert to numpy arrays
         for k, v in obs_copy.items():
-            if not isinstance(v, np.ndarray):
+            if isinstance(v, str):
+                # Text is a per-sample modality. Keep an explicit batch
+                # dimension for the GR00T transform's apply_batch path.
+                obs_copy[k] = np.asarray([v])
+            elif not isinstance(v, np.ndarray):
                 obs_copy[k] = np.array(v)
 
         normalized_input = self.apply_transforms(obs_copy)
@@ -279,6 +308,17 @@ class Gr00tPolicy(BasePolicy):
         """Load the transforms for the model."""
         # Load metadata for normalization stats
         metadata_path = exp_cfg_dir / "metadata.json"
+        if not metadata_path.exists():
+            action_regression_cfg_path = exp_cfg_dir / "action_regression_config.json"
+            if action_regression_cfg_path.exists():
+                with open(action_regression_cfg_path, "r") as f:
+                    action_regression_cfg = json.load(f)
+                source_checkpoint_path = action_regression_cfg.get("checkpoint_path")
+                if source_checkpoint_path:
+                    fallback_path = Path(source_checkpoint_path) / "experiment_cfg" / "metadata.json"
+                    if fallback_path.exists():
+                        print(f"metadata.json not found at {metadata_path}, falling back to {fallback_path}")
+                        metadata_path = fallback_path
         with open(metadata_path, "r") as f:
             metadatas = json.load(f)
 
@@ -343,6 +383,8 @@ def unsqueeze_dict_values(data: Dict[str, Any]) -> Dict[str, Any]:
             unsqueezed_data[k] = np.expand_dims(np.array(v), axis=0)  # Fixed
         elif isinstance(v, torch.Tensor):
             unsqueezed_data[k] = v.unsqueeze(0)
+        elif isinstance(v, str):
+            unsqueezed_data[k] = np.asarray([v])
         else:
             unsqueezed_data[k] = v
     return unsqueezed_data
@@ -356,7 +398,7 @@ def squeeze_dict_values(data: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(v, np.ndarray):
             squeezed_data[k] = np.squeeze(v, axis=0)  # Fixed: only remove batch dim
         elif isinstance(v, torch.Tensor):
-            unsqueezed_data[k] = v.squeeze(0)  # Fixed: only remove batch dim
+            squeezed_data[k] = v.squeeze(0)  # Fixed: only remove batch dim
         else:
             squeezed_data[k] = v
     return squeezed_data

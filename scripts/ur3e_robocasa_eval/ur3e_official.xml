@@ -1,0 +1,145 @@
+<?xml version="1.0" ?>
+<mujoco model="ur3e_official">
+  <compiler angle="radian"/>
+  <option timestep="0.002" integrator="implicit"/>
+
+  <asset>
+    <material name="URBlack" specular="0.5" shininess="0.25"
+              rgba="0.033102 0.033102 0.033102 1"/>
+    <material name="URJointGrey" specular="0.5" shininess="0.25"
+              rgba="0.278431 0.278431 0.278431 1"/>
+    <material name="URLinkGrey" specular="0.5" shininess="0.25"
+              rgba="0.820392 0.820392 0.820392 1"/>
+    <material name="URBlue" specular="0.5" shininess="0.25"
+              rgba="0.490196 0.678431 0.800000 1"/>
+
+    <!-- Official Universal Robots UR3e collision meshes used as stable
+         MuJoCo-compatible visual geometry as well. -->
+    <mesh name="ur3e_base"
+          file="/data/zjw/workspace/ur_description/meshes/ur3e/collision/base.stl"/>
+    <mesh name="ur3e_shoulder"
+          file="/data/zjw/workspace/ur_description/meshes/ur3e/collision/shoulder.stl"/>
+    <mesh name="ur3e_upperarm"
+          file="/data/zjw/workspace/ur_description/meshes/ur3e/collision/upperarm.stl"/>
+    <mesh name="ur3e_forearm"
+          file="/data/zjw/workspace/ur_description/meshes/ur3e/collision/forearm.stl"/>
+    <mesh name="ur3e_wrist1"
+          file="/data/zjw/workspace/ur_description/meshes/ur3e/collision/wrist1.stl"/>
+    <mesh name="ur3e_wrist2"
+          file="/data/zjw/workspace/ur_description/meshes/ur3e/collision/wrist2.stl"/>
+    <mesh name="ur3e_wrist3"
+          file="/data/zjw/workspace/ur_description/meshes/ur3e/collision/wrist3.stl"/>
+  </asset>
+
+  <actuator>
+    <motor name="torq_j1" joint="shoulder_pan_joint"
+           ctrllimited="true" ctrlrange="-54 54"/>
+    <motor name="torq_j2" joint="shoulder_lift_joint"
+           ctrllimited="true" ctrlrange="-54 54"/>
+    <motor name="torq_j3" joint="elbow_joint"
+           ctrllimited="true" ctrlrange="-28 28"/>
+    <motor name="torq_j4" joint="wrist_1_joint"
+           ctrllimited="true" ctrlrange="-9 9"/>
+    <motor name="torq_j5" joint="wrist_2_joint"
+           ctrllimited="true" ctrlrange="-9 9"/>
+    <motor name="torq_j6" joint="wrist_3_joint"
+           ctrllimited="true" ctrlrange="-9 9"/>
+  </actuator>
+
+  <worldbody>
+    <body name="base" pos="0 0 0">
+      <camera mode="fixed" name="robotview"
+              pos="-0.6 0 1.15"
+              quat="0.653 0.271 0.271 0.653" fovy="60"/>
+      <camera mode="fixed" name="agentview_left"
+              pos="-0.5 0.35 1.05"
+              quat="0.55623853 0.29935253 -0.37678665 -0.6775092"
+              fovy="60"/>
+      <camera mode="fixed" name="agentview_right"
+              pos="-0.5 -0.35 1.05"
+              quat="0.67750919 0.37678668 -0.29935256 -0.55623859"
+              fovy="60"/>
+      <body name="fixed_base_link" pos="0 0 0">
+        <site name="right_center" pos="0 0 0" size="0.01"
+              rgba="1 0.3 0.3 1" group="2"/>
+        <geom name="base_vis" type="mesh" mesh="ur3e_base"
+              material="URBlack" contype="0" conaffinity="0" group="1"/>
+        <body name="shoulder_link" pos="0 0 0.15185">
+          <inertial pos="0 0 0" mass="1.98"
+                    diaginertia="0.008 0.008 0.006"/>
+          <joint name="shoulder_pan_joint" pos="0 0 0" axis="0 0 1"
+                  limited="true" range="-6.283185 6.283185"
+                  damping="0.05" armature="0.02"/>
+          <geom name="shoulder_vis" type="mesh" mesh="ur3e_shoulder"
+                material="URJointGrey" contype="0" conaffinity="0" group="1"/>
+
+          <body name="upper_arm_link" pos="0 0.13105 0"
+                quat="0.707107 0 0.707107 0">
+            <inertial pos="0 0 0.12" mass="3.4445"
+                      diaginertia="0.022 0.022 0.01"/>
+            <joint name="shoulder_lift_joint" pos="0 0 0" axis="0 1 0"
+                    limited="true" range="-6.283185 6.283185"
+                    damping="0.05" armature="0.02"/>
+            <geom name="upper_arm_vis" type="mesh" mesh="ur3e_upperarm"
+                  material="URLinkGrey" contype="0" conaffinity="0" group="1"/>
+
+            <body name="forearm_link" pos="0 -0.13105 0.24355">
+              <inertial pos="0 0 0.1" mass="1.437"
+                        diaginertia="0.007 0.007 0.004"/>
+              <joint name="elbow_joint" pos="0 0 0" axis="0 1 0"
+                      limited="true" range="-3.141593 3.141593"
+                      damping="0.05" armature="0.02"/>
+              <geom name="forearm_vis" type="mesh" mesh="ur3e_forearm"
+                    material="URBlue" contype="0" conaffinity="0" group="1"/>
+
+              <body name="wrist_1_link" pos="0 0 0.2132"
+                    quat="0.707107 0 0.707107 0">
+                <inertial pos="0 0 0" mass="0.871"
+                          diaginertia="0.0021 0.0021 0.0023"/>
+                <joint name="wrist_1_joint" pos="0 0 0" axis="0 1 0"
+                        limited="true" range="-6.283185 6.283185"
+                        damping="0.03" armature="0.01"/>
+                <geom name="wrist1_vis" type="mesh" mesh="ur3e_wrist1"
+                      material="URJointGrey" contype="0" conaffinity="0"
+                      group="1"/>
+
+                <body name="wrist_2_link" pos="0 0.08535 0">
+                  <inertial pos="0 0 0" mass="0.805"
+                            diaginertia="0.0021 0.0021 0.0023"/>
+                  <joint name="wrist_2_joint" pos="0 0 0" axis="0 0 1"
+                          limited="true" range="-6.283185 6.283185"
+                          damping="0.03" armature="0.01"/>
+                  <geom name="wrist2_vis" type="mesh" mesh="ur3e_wrist2"
+                        material="URBlue" contype="0" conaffinity="0" group="1"/>
+
+                  <body name="wrist_3_link" pos="0 0 0.0921">
+                    <inertial pos="0 0 0" mass="0.261"
+                              diaginertia="0.00015 0.00015 0.0002"/>
+                    <joint name="wrist_3_joint" pos="0 0 0" axis="0 1 0"
+                            limited="false" damping="0.03" armature="0.01"/>
+                    <geom name="wrist3_vis" type="mesh" mesh="ur3e_wrist3"
+                          material="URLinkGrey" contype="0" conaffinity="0"
+                          group="1"/>
+
+                    <body name="right_hand" pos="0 0.0921 0"
+                          quat="0.707 -0.707 0 0">
+                      <camera mode="fixed" name="eye_in_hand"
+                              pos="0.05 0 0"
+                              quat="0 0.707108 0.707108 0"
+                              fovy="75"/>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+    <!-- This camera is a world-space review camera. The evaluator updates its
+         pose after reset, so it must not be nested under robot0_base. -->
+    <camera mode="fixed" name="review_camera"
+            pos="3.05 -3.25 1.9"
+            quat="1 0 0 0" fovy="60"/>
+  </worldbody>
+</mujoco>

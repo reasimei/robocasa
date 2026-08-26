@@ -14,14 +14,18 @@
 # limitations under the License.
 
 
+import pickle
 import os
+import random
 from typing import Optional
 
+import numpy as np
 import torch
 import transformers
 from torch.utils.data import Dataset, Sampler
 from transformers.trainer import (
     ALL_LAYERNORM_LAYERS,
+    ParallelMode,
     TRAINER_STATE_NAME,
     TrainerState,
     get_last_checkpoint,
@@ -126,6 +130,39 @@ class DualBrainTrainer(transformers.Trainer):
 
         if self.args.should_save:
             return self.model.save_pretrained(output_dir, state_dict=state_dict)
+
+    def _load_rng_state(self, checkpoint):
+        try:
+            return super()._load_rng_state(checkpoint)
+        except pickle.UnpicklingError as exc:
+            if checkpoint is None:
+                return
+
+            if self.args.world_size > 1:
+                process_index = self.args.process_index
+                rng_file = os.path.join(checkpoint, f"rng_state_{process_index}.pth")
+            else:
+                rng_file = os.path.join(checkpoint, "rng_state.pth")
+
+            if not os.path.isfile(rng_file):
+                print(f"Warning: RNG state file not found at {rng_file}, skipping RNG restore.")
+                return
+
+            print(
+                f"Warning: failed to load RNG state with weights_only=True from {rng_file}: {exc}\n"
+                "Falling back to weights_only=False for trusted local checkpoint."
+            )
+            checkpoint_rng_state = torch.load(rng_file, weights_only=False)
+            random.setstate(checkpoint_rng_state["python"])
+            np.random.set_state(checkpoint_rng_state["numpy"])
+            torch.random.set_rng_state(checkpoint_rng_state["cpu"])
+
+            is_distributed = self.args.parallel_mode == ParallelMode.DISTRIBUTED
+            if torch.cuda.is_available() and "cuda" in checkpoint_rng_state:
+                if is_distributed:
+                    torch.cuda.random.set_rng_state_all(checkpoint_rng_state["cuda"])
+                else:
+                    torch.cuda.random.set_rng_state(checkpoint_rng_state["cuda"])
 
     def train(
         self,

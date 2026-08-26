@@ -183,11 +183,12 @@ class GR00T_N1_5(PreTrainedModel):
         self.validate_inputs(inputs)
         backbone_inputs = self.backbone.prepare_input(inputs)
         action_inputs = self.action_head.prepare_input(inputs)
+        target_dtype = self._get_runtime_dtype()
 
         def to_device_with_maybe_dtype(x):
             # Only cast to self.compute_dtype if the tensor is floating
             if torch.is_floating_point(x):
-                return x.to(self.device, dtype=self.action_head.dtype)
+                return x.to(self.device, dtype=target_dtype)
             else:
                 # Keep original dtype
                 return x.to(self.device)
@@ -195,6 +196,25 @@ class GR00T_N1_5(PreTrainedModel):
         backbone_inputs = tree.map_structure(to_device_with_maybe_dtype, backbone_inputs)
         action_inputs = tree.map_structure(to_device_with_maybe_dtype, action_inputs)
         return backbone_inputs, action_inputs
+
+    def _get_runtime_dtype(self) -> torch.dtype:
+        """
+        Resolve the compute dtype without assuming the action head exposes parameters.
+
+        Some auxiliary-training setups freeze or partially strip the action head, which
+        can leave `self.action_head.parameters()` empty. In that case we fall back to the
+        backbone dtype, and finally to the config-declared compute dtype.
+        """
+        for module in (self.action_head, self.backbone, self):
+            try:
+                return next(iter(module.parameters())).dtype
+            except StopIteration:
+                continue
+
+        config_dtype = getattr(torch, str(self.compute_dtype), None)
+        if isinstance(config_dtype, torch.dtype):
+            return config_dtype
+        return torch.float32
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
