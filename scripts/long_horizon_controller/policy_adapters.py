@@ -2,11 +2,58 @@
 from __future__ import annotations
 
 import json
+import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
+
+
+def resolve_observation_history_offsets(
+    aux_head_path: str = "",
+    requested: str = "auto",
+) -> list[int]:
+    """Resolve the online observation history from the auxiliary checkpoint."""
+    if requested != "auto":
+        values = [int(item.strip()) for item in requested.split(",") if item.strip()]
+    elif aux_head_path:
+        config_path = Path(aux_head_path) / "aux_config.json"
+        if config_path.is_file():
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            values = [int(item) for item in config.get("observation_history_offsets", [])]
+        else:
+            values = []
+    else:
+        values = []
+
+    if not values:
+        return [0]
+    if values[-1] != 0 or any(value > 0 for value in values):
+        raise ValueError(
+            "observation history offsets must be non-positive and end with 0, "
+            f"got {values}"
+        )
+    if len(values) > 1:
+        step = values[1] - values[0]
+        if step <= 0 or any(b - a != step for a, b in zip(values, values[1:])):
+            raise ValueError(
+                "observation history offsets must be evenly spaced and ordered, "
+                f"got {values}"
+            )
+    return values
+
+
+def configured_data_config(
+    data_config_name: str,
+    observation_history_offsets: list[int],
+) -> Any:
+    """Return an isolated data config whose observation horizon matches online input."""
+    from gr00t.experiment.data_config import DATA_CONFIG_MAP
+
+    data_config = copy.deepcopy(DATA_CONFIG_MAP[data_config_name])
+    data_config.observation_indices = list(observation_history_offsets)
+    return data_config
 
 
 class PolicyAdapter(Protocol):

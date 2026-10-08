@@ -39,6 +39,7 @@ class RobocasaVectorEnvAdapter:
     )
     host: str = "localhost"
     port: int = 0
+    reset_seed: int | None = None
 
     def __post_init__(self) -> None:
         if int(self.simulation_config.n_envs) != 1:
@@ -67,7 +68,7 @@ class RobocasaVectorEnvAdapter:
         return labels.get(key, key.rsplit(".", 1)[-1])
 
     def reset(self) -> dict[str, Any]:
-        observation, _ = self._env.reset()
+        observation, _ = self._env.reset(seed=self.reset_seed)
         return observation
 
     def step(self, action: dict[str, Any]) -> tuple[dict[str, Any], float, bool, dict[str, Any]]:
@@ -120,7 +121,11 @@ class RobocasaVectorEnvAdapter:
                 # Keeping the latest command avoids opening a grasp during a
                 # pose rollback.
                 reversed_array[...] = time_major[-1]
-            rollback[key] = reversed_array
+            # ``self._env`` is a Gym vector environment. Normal policy actions
+            # have shape (n_envs=1, T, D); retain that batch axis for rollback.
+            # Dropping it makes the vector wrapper interpret T as n_envs, then
+            # hands one-dimensional action vectors to MultiStepWrapper.
+            rollback[key] = reversed_array[None, ...] if had_batch_dim else reversed_array
         return rollback
 
     def get_vlm_image(self, observation: dict[str, Any]) -> Any:

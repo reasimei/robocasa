@@ -93,7 +93,7 @@ class OpenAICompatiblePlanner:
             },
             method="POST",
         )
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener()
         try:
             with opener.open(request, timeout=self.timeout_sec) as response:
                 raw = response.read().decode("utf-8")
@@ -160,7 +160,7 @@ class OllamaPlanner:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener()
         try:
             with opener.open(request, timeout=self.timeout_sec) as response:
                 raw = response.read().decode("utf-8")

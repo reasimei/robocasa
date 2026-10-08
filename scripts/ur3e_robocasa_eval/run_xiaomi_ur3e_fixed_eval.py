@@ -268,19 +268,77 @@ def _load_target_eef_pose(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return position, quaternion
 
 
-def _current_eef_pose(env: Any) -> tuple[np.ndarray, np.ndarray]:
-    """Read the same EEF position / orientation fields used in the rollout."""
+def _current_eef_pose(
+    env: Any,
+    *,
+    orientation_source: str = "body",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read the EEF position and either body or grip-site orientation."""
     robot = env.robots[0]
     arm = "right"
     site_id = robot.eef_site_id[arm]
-    body_name = robot.robot_model.eef_name[arm]
     position = np.asarray(env.sim.data.site_xpos[site_id], dtype=np.float64)
-    quaternion = T.convert_quat(
-        np.asarray(env.sim.data.get_body_xquat(body_name), dtype=np.float64),
-        to="xyzw",
-    )
+    if orientation_source == "site":
+        rotation = np.asarray(
+            env.sim.data.site_xmat[site_id], dtype=np.float64
+        ).reshape(3, 3)
+        quaternion = T.mat2quat(rotation)
+    elif orientation_source == "body":
+        body_name = robot.robot_model.eef_name[arm]
+        quaternion = T.convert_quat(
+            np.asarray(env.sim.data.get_body_xquat(body_name), dtype=np.float64),
+            to="xyzw",
+        )
+    else:
+        raise ValueError(
+            f"Unknown orientation_source={orientation_source!r}; "
+            "expected 'body' or 'site'"
+        )
     quaternion /= max(np.linalg.norm(quaternion), 1e-12)
     return position, quaternion
+
+
+def _collision_violations(
+    env: Any,
+    *,
+    geom_tokens: tuple[str, ...],
+    max_allowed_penetration: float,
+) -> list[dict[str, Any]]:
+    """Return excessive robot/object penetrations in the current state.
+
+    The replay evaluator must keep normal contact physics enabled. This
+    helper only rejects an IK candidate before the next dynamic step when it
+    would place a robot collision geom deeply inside a named object.
+    """
+    if not geom_tokens:
+        return []
+
+    violations: list[dict[str, Any]] = []
+    robot_tokens = ("robot0_", "gripper0_", "mobilebase0_")
+    for index in range(int(env.sim.data.ncon)):
+        contact = env.sim.data.contact[index]
+        geom1 = env.sim.model.geom_id2name(int(contact.geom1)) or ""
+        geom2 = env.sim.model.geom_id2name(int(contact.geom2)) or ""
+        names = (geom1, geom2)
+        has_robot = any(
+            any(token in name for token in robot_tokens) for name in names
+        )
+        has_target = any(
+            any(token in name for token in geom_tokens) for name in names
+        )
+        if not (has_robot and has_target):
+            continue
+        penetration = max(0.0, -float(contact.dist))
+        if penetration > max_allowed_penetration:
+            violations.append(
+                {
+                    "geom1": geom1,
+                    "geom2": geom2,
+                    "dist": float(contact.dist),
+                    "penetration_m": penetration,
+                }
+            )
+    return violations
 
 
 def align_initial_eef_to(
@@ -294,19 +352,40 @@ def align_initial_eef_to(
     damping: float = 0.04,
     step_scale: float = 0.7,
     allow_base_translation: bool = True,
-    base_translation_weight: float = 0.02,
+    base_translation_weight: float = 5.0,
     max_base_step: float = 0.03,
+    base_translation_axes: tuple[bool, bool, bool] = (True, True, False),
+    orientation_source: str = "body",
+    max_joint_step: float | None = None,
+    max_total_joint_step: float | None = None,
+    collision_check_tokens: tuple[str, ...] = (),
+    max_allowed_penetration: float = 0.0015,
+    max_penetration_increase: float = 0.00025,
+    orientation_weight: float = 1.0,
 ) -> dict[str, Any]:
     """Align the UR3e EEF with damped least-squares IK.
 
-    The position Jacobian is taken at the Robotiq grip site, while the
-    orientation is taken from the UR3e EEF body. This matches RoboSuite's
-    ``robot0_eef_pos`` and ``robot0_eef_quat`` observation conventions.
+    The position Jacobian is taken at the Robotiq grip site. By default the
+    orientation is taken from the UR3e EEF body to preserve legacy behavior.
+    ``orientation_source="site"`` makes both pose and orientation Jacobians
+    refer to the same grip site, which is useful for cross-robot replay.
 
     When explicitly aligning to a Franka pose, the fixed base may also be
-    translated in world XYZ. The base translation has an identity Jacobian
-    for EEF position and zero Jacobian for orientation. A regularizer keeps
-    the solved base close to its nominal installation pose.
+    translated in selected world axes. The base translation has an identity
+    Jacobian for EEF position and zero Jacobian for orientation. A regularizer
+    keeps the solved base close to its nominal installation pose. By default
+    only XY translation is allowed, so the base remains on the installation
+    plane.
+
+    ``max_joint_step`` and ``collision_check_tokens`` are intended for
+    replaying recorded trajectories. They prevent a bad IK iterate from
+    teleporting the arm through an object before MuJoCo can resolve contact.
+    ``max_total_joint_step`` additionally bounds the complete movement made
+    while solving one recorded target.
+
+    ``orientation_weight`` can be lowered for diagnostic alignment when a
+    source robot's end-effector orientation is not reachable by the target
+    robot. It does not change the subsequent controller or replay behavior.
     """
     robot = env.robots[0]
     arm = "right"
@@ -323,13 +402,22 @@ def align_initial_eef_to(
     target_position = np.asarray(target_position, dtype=np.float64)
     target_quaternion_xyzw = np.asarray(target_quaternion_xyzw, dtype=np.float64)
     target_quaternion_xyzw /= max(np.linalg.norm(target_quaternion_xyzw), 1e-12)
+    orientation_weight = max(float(orientation_weight), 0.0)
+    if orientation_source not in {"body", "site"}:
+        raise ValueError(
+            f"Unknown orientation_source={orientation_source!r}; "
+            "expected 'body' or 'site'"
+        )
     base_body_id = env.sim.model.body_name2id("robot0_base")
     start_base_position = np.asarray(
         env.sim.model.body_pos[base_body_id], dtype=np.float64
     ).copy()
 
     def errors() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        current_position, current_quaternion = _current_eef_pose(env)
+        current_position, current_quaternion = _current_eef_pose(
+            env,
+            orientation_source=orientation_source,
+        )
         position_error = target_position - current_position
         orientation_error = T.get_orientation_error(
             target_quaternion_xyzw, current_quaternion
@@ -342,9 +430,41 @@ def align_initial_eef_to(
         )
 
     start_qpos = np.asarray(env.sim.data.qpos[qpos_indexes], dtype=np.float64).copy()
+    start_base_position_current = np.asarray(
+        env.sim.model.body_pos[base_body_id], dtype=np.float64
+    ).copy()
     _, _, start_position_error, start_orientation_error = errors()
     iterations = 0
     converged = False
+    collision_rejected = False
+    collision_violations: list[dict[str, Any]] = []
+    rejected_reason: str | None = None
+    last_valid_qpos = start_qpos.copy()
+    last_valid_base_position = start_base_position_current.copy()
+    last_valid_score = float("inf")
+    joint_step_limit = 0.15 if max_joint_step is None else max_joint_step
+
+    def normalized_error_score() -> float:
+        _, _, position_error, orientation_error = errors()
+        return float(
+            np.linalg.norm(position_error) / max(position_tolerance, 1e-6)
+            + orientation_weight
+            * np.linalg.norm(orientation_error)
+            / max(orientation_tolerance, 1e-6)
+        )
+
+    def target_penetration() -> float:
+        contacts = _collision_violations(
+            env,
+            geom_tokens=collision_check_tokens,
+            max_allowed_penetration=-1.0,
+        )
+        if not contacts:
+            return 0.0
+        return max(float(item["penetration_m"]) for item in contacts)
+
+    initial_penetration = target_penetration()
+    last_valid_score = normalized_error_score()
 
     for iterations in range(1, max_iterations + 1):
         (
@@ -355,7 +475,10 @@ def align_initial_eef_to(
         ) = errors()
         if (
             np.linalg.norm(position_error) <= position_tolerance
-            and np.linalg.norm(orientation_error) <= orientation_tolerance
+            and (
+                orientation_weight == 0.0
+                or np.linalg.norm(orientation_error) <= orientation_tolerance
+            )
         ):
             converged = True
             break
@@ -363,23 +486,39 @@ def align_initial_eef_to(
         jacobian_position = env.sim.data.get_site_jacp(eef_site).reshape(
             (3, -1)
         )[:, qvel_indexes]
-        jacobian_orientation = env.sim.data.get_body_jacr(eef_body).reshape(
-            (3, -1)
-        )[:, qvel_indexes]
+        if orientation_source == "site":
+            jacobian_orientation = env.sim.data.get_site_jacr(eef_site).reshape(
+                (3, -1)
+            )[:, qvel_indexes]
+        else:
+            jacobian_orientation = env.sim.data.get_body_jacr(eef_body).reshape(
+                (3, -1)
+            )[:, qvel_indexes]
         arm_jacobian = np.vstack((jacobian_position, jacobian_orientation))
-        task_error = np.concatenate((position_error, orientation_error))
+        task_error = np.concatenate(
+            (position_error, orientation_weight * orientation_error)
+        )
 
-        if allow_base_translation:
+        base_axes = np.flatnonzero(np.asarray(base_translation_axes, dtype=bool))
+        if allow_base_translation and base_axes.size:
             # The base position is a world-frame root-body translation.
             jacobian = np.column_stack(
-                (arm_jacobian, np.vstack((np.eye(3), np.zeros((3, 3)))))
+                (
+                    arm_jacobian,
+                    np.vstack(
+                        (
+                            np.eye(3, dtype=np.float64)[:, base_axes],
+                            np.zeros((3, base_axes.size), dtype=np.float64),
+                        )
+                    ),
+                )
             )
             regularizer = np.diag(
                 np.concatenate(
                     (
                         np.full(6, damping**2, dtype=np.float64),
                         np.full(
-                            3,
+                            base_axes.size,
                             (damping * base_translation_weight) ** 2,
                             dtype=np.float64,
                         ),
@@ -396,10 +535,12 @@ def align_initial_eef_to(
         delta *= step_scale
         delta_q = delta[:6]
         delta_norm = np.linalg.norm(delta_q)
-        if delta_norm > 0.15:
-            delta_q *= 0.15 / delta_norm
+        joint_step_limited = False
+        if delta_norm > joint_step_limit:
+            delta_q *= joint_step_limit / delta_norm
+            joint_step_limited = True
 
-        if allow_base_translation:
+        if allow_base_translation and base_axes.size:
             delta_base = delta[6:]
             base_norm = np.linalg.norm(delta_base)
             if base_norm > max_base_step:
@@ -413,14 +554,68 @@ def align_initial_eef_to(
         for index, (lower, upper) in enumerate(ranges):
             if lower < upper:
                 qpos[index] = np.clip(qpos[index], lower + 1e-5, upper - 1e-5)
+        if (
+            max_total_joint_step is not None
+            and np.linalg.norm(qpos - start_qpos) > max_total_joint_step
+        ):
+            collision_rejected = True
+            rejected_reason = "max_total_joint_step"
+            break
         env.sim.data.qpos[qpos_indexes] = qpos
         env.sim.data.qvel[qvel_indexes] = 0.0
-        if allow_base_translation:
+        env.sim.data.qacc[qvel_indexes] = 0.0
+        if allow_base_translation and base_axes.size:
+            full_delta_base = np.zeros(3, dtype=np.float64)
+            full_delta_base[base_axes] = delta_base
             env.sim.model.body_pos[base_body_id] = (
                 np.asarray(env.sim.model.body_pos[base_body_id], dtype=np.float64)
-                + delta_base
+                + full_delta_base
             )
         env.sim.forward()
+
+        candidate_violations = _collision_violations(
+            env,
+            geom_tokens=collision_check_tokens,
+            max_allowed_penetration=max_allowed_penetration,
+        )
+        candidate_penetration = target_penetration()
+        if candidate_violations or (
+            candidate_penetration
+            > initial_penetration + max_penetration_increase
+        ):
+            env.sim.data.qpos[qpos_indexes] = last_valid_qpos
+            env.sim.data.qvel[qvel_indexes] = 0.0
+            env.sim.data.qacc[qvel_indexes] = 0.0
+            env.sim.model.body_pos[base_body_id] = last_valid_base_position
+            env.sim.forward()
+            collision_rejected = True
+            rejected_reason = "collision_penetration"
+            collision_violations = candidate_violations or [
+                {
+                    "penetration_m": candidate_penetration,
+                    "initial_penetration_m": initial_penetration,
+                    "max_penetration_increase_m": max_penetration_increase,
+                }
+            ]
+            break
+
+        candidate_score = normalized_error_score()
+        if candidate_score > last_valid_score * 1.02:
+            env.sim.data.qpos[qpos_indexes] = last_valid_qpos
+            env.sim.data.qvel[qvel_indexes] = 0.0
+            env.sim.data.qacc[qvel_indexes] = 0.0
+            env.sim.model.body_pos[base_body_id] = last_valid_base_position
+            env.sim.forward()
+            rejected_reason = "error_increased"
+            break
+
+        last_valid_qpos = np.asarray(
+            env.sim.data.qpos[qpos_indexes], dtype=np.float64
+        ).copy()
+        last_valid_base_position = np.asarray(
+            env.sim.model.body_pos[base_body_id], dtype=np.float64
+        ).copy()
+        last_valid_score = candidate_score
 
     (
         solved_position,
@@ -432,7 +627,10 @@ def align_initial_eef_to(
         converged
         or (
             np.linalg.norm(final_position_error) <= position_tolerance
-            and np.linalg.norm(final_orientation_error) <= orientation_tolerance
+            and (
+                orientation_weight == 0.0
+                or np.linalg.norm(final_orientation_error) <= orientation_tolerance
+            )
         )
     )
 
@@ -460,10 +658,27 @@ def align_initial_eef_to(
             - start_base_position
         ).tolist(),
         "allow_base_translation": bool(allow_base_translation),
+        "base_translation_axes": [
+            axis for axis, enabled in zip("xyz", base_translation_axes) if enabled
+        ],
         "iterations": iterations,
         "converged": converged,
+        "max_joint_step": float(joint_step_limit),
+        "max_total_joint_step": (
+            None
+            if max_total_joint_step is None
+            else float(max_total_joint_step)
+        ),
+        "collision_check_tokens": list(collision_check_tokens),
+        "max_allowed_penetration_m": float(max_allowed_penetration),
+        "max_penetration_increase_m": float(max_penetration_increase),
+        "collision_rejected": collision_rejected,
+        "collision_violations": collision_violations,
+        "rejected_reason": rejected_reason,
         "eef_body": eef_body,
         "eef_site": eef_site,
+        "orientation_source": orientation_source,
+        "orientation_weight": orientation_weight,
     }
 
 

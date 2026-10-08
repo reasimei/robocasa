@@ -97,6 +97,101 @@ Use `--verifier qwen_vl` to load it. The dry-run verifier is the default for smo
 In the current `robocasa` environment, `transformers==4.51.3` does not recognize
 `model_type=qwen3_vl`; upgrade `transformers` before running the real local VLM verifier.
 
+## VLM Benchmark
+
+`benchmark_vlm.py` compares verifier backends on identical saved VLM frames and
+uses the production verifier prompt and JSON schema. Model arguments are
+`ollama:MODEL` for local Ollama or `api:MODEL` for an OpenAI-compatible API.
+
+First export a reproducible case set from saved rollout events. The generated
+JSONL is intentionally unlabeled: add `expected_status` (`complete`,
+`in_progress`, or `failed`) after visually reviewing each case before using it
+to compare decision quality.
+
+```bash
+conda run -n robocasa python -m scripts.long_horizon_controller.benchmark_vlm \
+  --models ollama:qwen3-vl:8b \
+  --eval-root expdata/long_horizon_controller/composite_seen_full_lhc_aux11000_qwen25vl7b_dualview/evals/target \
+  --max-cases 60 \
+  --export-cases expdata/long_horizon_controller/vlm_benchmark/cases.jsonl
+```
+
+With reviewed labels, compare local Qwen with a GPT model enabled for the API
+key. `gpt-5.2` is an example; choose a model name available to the account.
+
+```bash
+export OPENAI_API_KEY=...
+conda run -n robocasa python -m scripts.long_horizon_controller.benchmark_vlm \
+  --models ollama:qwen3-vl:8b api:gpt-5.2 \
+  --cases expdata/long_horizon_controller/vlm_benchmark/cases.jsonl \
+  --output expdata/long_horizon_controller/vlm_benchmark/qwen_vs_gpt52.json
+```
+
+The output contains per-case raw responses, parsed decisions, request latency,
+available token usage, JSON parse rate, and, when labels are present, status
+accuracy, per-status precision/recall/F1, and macro F1. Use
+`--api-endpoint chat_completions` for an OpenAI-compatible endpoint that does
+not implement the Responses API.
+
+The benchmark also supports the local Hugging Face Qwen checkpoint directly:
+
+```bash
+conda run -n robocasa python -m scripts.long_horizon_controller.benchmark_vlm \
+  --models 'local:/data/zjw/.cache/huggingface/hub/models--unsloth--Qwen3-VL-8B-Instruct-unsloth-bnb-4bit/snapshots/b5b904c3fcdc7541adf2a2bb219b0ed95288c794' \
+  --cases expdata/long_horizon_controller/vlm_benchmark/cases_10tasks_50.jsonl \
+  --output expdata/long_horizon_controller/vlm_benchmark/qwen3vl_local.json
+```
+
+`local:PATH` loads the checkpoint with `LocalQwenVLVerifier`. It is different
+from `ollama:MODEL`: Ollama cannot use a Hugging Face snapshot path as its model
+name. To test an Ollama model, import/register it in Ollama first and pass its
+actual tag, for example `ollama:qwen3-vl:8b`.
+
+To create a diverse 50-case set, use `--num-tasks 10`. The sampler requests one
+`complete`, two `in_progress`, and two `retry` cases per task. Existing rollout
+events do not contain enough `in_progress` cases for all tasks, so fallback rows
+are marked with `sampling_fallback: true`; inspect or relabel them before
+reporting accuracy. `reference_status` is the old rollout verifier result and
+is useful for stratification or agreement only, not independent ground truth.
+
+For ground-truth labels derived from the auxiliary-head data, build cases with:
+
+```bash
+conda run -n robocasa python scripts/long_horizon_controller/build_aux_vlm_cases.py \
+  --num-tasks 10 --cases-per-task 5 \
+  --complete-per-task 1 --progress-per-task 2 --retry-per-task 2 \
+  --output expdata/long_horizon_controller/vlm_benchmark/aux_cases_10tasks_50.jsonl
+```
+
+This labels terminal positive frames as `complete`, middle positive frames as
+`in_progress`, and synthetic retry frames as `failed`.
+
+```bash
+conda run -n robocasa python -m scripts.long_horizon_controller.benchmark_vlm \
+  --models api:gpt-5.6-sol \
+  --num-tasks 10 --cases-per-task 5 \
+  --complete-per-task 1 --progress-per-task 2 --retry-per-task 2 \
+  --export-cases expdata/long_horizon_controller/vlm_benchmark/cases_10tasks_50.jsonl
+
+conda run -n robocasa python -m scripts.long_horizon_controller.benchmark_vlm \
+  --models api:gpt-5.6-sol \
+  --cases expdata/long_horizon_controller/vlm_benchmark/cases_10tasks_50.jsonl \
+  --output expdata/long_horizon_controller/vlm_benchmark/gpt56_10tasks_50.json
+```
+
+The benchmark atomically checkpoints the output after every completed case. To
+continue an interrupted run, rerun the identical command with the same
+`--output` path and add `--resume`. Successfully parsed model/case pairs are
+skipped; failed requests are retried.
+
+```bash
+conda run -n robocasa python -m scripts.long_horizon_controller.benchmark_vlm \
+  --models ollama:qwen3-vl:8b api:gpt-5.2 \
+  --cases expdata/long_horizon_controller/vlm_benchmark/cases.jsonl \
+  --output expdata/long_horizon_controller/vlm_benchmark/qwen_vs_gpt52.json \
+  --resume
+```
+
 ## Dry Run
 
 From the repository root:

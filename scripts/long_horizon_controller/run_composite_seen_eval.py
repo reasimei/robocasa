@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -20,16 +21,25 @@ from robocasa.utils.dataset_registry import TASK_SET_REGISTRY
 from robocasa.utils.dataset_registry_utils import get_task_horizon
 
 from gr00t.eval.simulation import MultiStepConfig, SimulationConfig, VideoConfig
-from gr00t.experiment.data_config import DATA_CONFIG_MAP
 from gr00t.model.policy import Gr00tPolicy
 
 from scripts.long_horizon_controller.controller import ControllerConfig, LongHorizonController
 from scripts.long_horizon_controller.fast_monitor import ActionEntropyMonitor, AuxHeadFusionMonitor
 from scripts.long_horizon_controller.planner import OllamaPlanner, OpenAICompatiblePlanner, StaticPlanner
-from scripts.long_horizon_controller.policy_adapters import Gr00tPolicyAdapter
+from scripts.long_horizon_controller.policy_adapters import (
+    Gr00tPolicyAdapter,
+    configured_data_config,
+    resolve_observation_history_offsets,
+)
 from scripts.long_horizon_controller.robocasa_adapter import RobocasaVectorEnvAdapter
 from scripts.long_horizon_controller.schemas import FastMonitorConfig, TaskPlan, VLMStatus, plan_from_dict
-from scripts.long_horizon_controller.vlm_verifier import DEFAULT_QWEN3_VL_PATH, DryRunVerifier, LocalQwenVLVerifier, OllamaVLVerifier
+from scripts.long_horizon_controller.vlm_verifier import (
+    DEFAULT_QWEN3_VL_PATH,
+    DryRunVerifier,
+    LocalQwenVLVerifier,
+    OllamaVLVerifier,
+    OpenAIVLVerifier,
+)
 from scripts.long_horizon_controller.xiaomi_policy_adapter import XiaomiPolicyAdapter
 
 
@@ -108,6 +118,16 @@ def make_verifier(args: argparse.Namespace):
             timeout_sec=args.vlm_timeout_sec,
             num_predict=args.vlm_num_predict,
             keep_alive=args.vlm_ollama_keep_alive,
+        )
+    if args.verifier == "api_vl":
+        return OpenAIVLVerifier(
+            model=args.vlm_api_model,
+            base_url=args.vlm_api_base_url or None,
+            timeout_sec=args.vlm_timeout_sec,
+            max_completion_tokens=args.vlm_api_max_completion_tokens,
+            reasoning_effort=args.vlm_api_reasoning_effort or None,
+            max_retries=args.vlm_api_max_retries,
+            retry_delay_sec=args.vlm_api_retry_delay_sec,
         )
     if args.verifier == "dry":
         return DryRunVerifier(default_status=VLMStatus(args.dry_vlm_status))
@@ -294,7 +314,13 @@ def load_episode_result(episode_dir: Path, episode_idx: int) -> dict[str, Any] |
 
 def save_batch_results(output_root: Path, rows: list[dict[str, Any]]) -> None:
     output_root.mkdir(parents=True, exist_ok=True)
-    completed = [row for row in rows if row.get("status") == "completed"]
+    # A resumed task is complete even when run_one_task returns
+    # ``skipped_existing`` because all requested episode stats already exist.
+    completed = [
+        row
+        for row in rows
+        if row.get("status") in {"completed", "skipped_existing"}
+    ]
     success_values = [float(row.get("success_rate", float(row["env_success"]))) for row in completed]
     payload = {
         "num_tasks": len(rows),
@@ -315,10 +341,18 @@ def run_one_episode(
     verifier: Any,
     policy_adapter: Any,
     episode_dir: Path,
+    episode_index: int,
 ) -> dict[str, Any]:
+    import torch
+
+    seed = args.seed_base + episode_index
+    torch.manual_seed(seed)
     max_episode_steps = args.max_episode_steps or get_task_horizon(task_name)
     video_delta_indices = np.array([0])
     state_delta_indices = np.array([0])
+    if args.policy_backend == "gr00t":
+        video_delta_indices = np.asarray(args.observation_history_offsets, dtype=np.int64)
+        state_delta_indices = video_delta_indices.copy()
     if args.policy_backend == "xiaomi":
         video_delta_indices = np.arange(
             -(args.xiaomi_history_length - 1) * args.xiaomi_history_interval_steps,
@@ -342,6 +376,7 @@ def run_one_episode(
     env = RobocasaVectorEnvAdapter(
         simulation_config=simulation_config,
         vlm_image_key=args.vlm_image_key,
+        reset_seed=seed,
     )
     try:
         if hasattr(policy_adapter, "reset"):
@@ -361,6 +396,7 @@ def run_one_episode(
                 retry_confidence_threshold=args.aux_retry_confidence_threshold,
                 success_confidence_threshold=args.aux_success_confidence_threshold,
                 cooldown_steps=args.aux_cooldown_steps,
+                min_steps_before_trigger=args.aux_min_steps_before_trigger,
             ),
             vlm_verifier=verifier,
             config=ControllerConfig(
@@ -371,6 +407,7 @@ def run_one_episode(
                 vlm_history_interval_sec=args.vlm_history_interval_sec,
                 save_vlm_frames=args.save_vlm_frames,
                 max_rollback_chunks=args.max_rollback_chunks,
+                policy_language_mode=args.policy_language_mode,
             ),
         )
         controller.run()
@@ -381,6 +418,8 @@ def run_one_episode(
     annotated_video = annotate_video(task_name, env_success, episode_dir) if args.annotate_videos else ""
     return {
         "env_success": env_success,
+        "seed": seed,
+        "episode_index": episode_index,
         "output_dir": str(episode_dir),
         "annotated_video": annotated_video,
     }
@@ -397,11 +436,29 @@ def run_one_task(
     output_root = Path(args.output_root)
     env_dir = output_root / "evals" / args.split / task_name
     stats_path = env_dir / "stats.json"
+    episode_progress = tqdm(
+        total=args.n_episodes,
+        desc=task_name,
+        unit="episode",
+        dynamic_ncols=True,
+        leave=True,
+        disable=not args.progress,
+    )
+
+    def close_episode_progress() -> None:
+        episode_progress.close()
+
     if stats_path.exists() and not args.overwrite:
         data = json.loads(stats_path.read_text(encoding="utf-8"))
         completed_episodes = int(data.get("num_episodes", 0))
         if completed_episodes >= args.n_episodes:
             success_rate = float(data.get("success_rate", 0.0))
+            episode_progress.update(args.n_episodes)
+            episode_progress.set_postfix(
+                success=f"{success_rate:.1%}",
+                status="complete",
+            )
+            close_episode_progress()
             return {
                 "task_name": task_name,
                 "task_instruction": task_instruction,
@@ -416,61 +473,90 @@ def run_one_task(
             flush=True,
         )
 
-    env_dir.mkdir(parents=True, exist_ok=True)
-    if plan is None:
-        raise RuntimeError(f"No plan was prepared for {task_name}.")
-    plan.save(env_dir / "plan.json")
+    try:
+        env_dir.mkdir(parents=True, exist_ok=True)
+        if plan is None:
+            raise RuntimeError(f"No plan was prepared for {task_name}.")
+        plan.save(env_dir / "plan.json")
 
-    start = time.perf_counter()
-    episode_results = []
-    for episode_idx in range(args.n_episodes):
-        episode_dir = env_dir / "episodes" / f"episode_{episode_idx:03d}"
-        episode_dir.mkdir(parents=True, exist_ok=True)
-        if not args.overwrite:
-            existing_result = load_episode_result(episode_dir, episode_idx)
-            if existing_result is not None:
+        start = time.perf_counter()
+        episode_results = []
+        for episode_idx in range(args.n_episodes):
+            episode_dir = env_dir / "episodes" / f"episode_{episode_idx:03d}"
+            episode_dir.mkdir(parents=True, exist_ok=True)
+            if not args.overwrite:
+                existing_result = load_episode_result(episode_dir, episode_idx)
+                if existing_result is not None:
+                    episode_results.append(existing_result)
+                    save_stats(env_dir, episode_results)
+                    episode_progress.update(1)
+                    success_count = sum(
+                        bool(result.get("env_success", False))
+                        for result in episode_results
+                    )
+                    episode_progress.set_postfix(
+                        success=f"{success_count}/{episode_progress.n}",
+                        status="resume",
+                    )
+                    continue
+            if args.progress:
+                tqdm.write(
+                    f"[long-horizon-eval] {task_name} episode "
+                    f"{episode_idx + 1}/{args.n_episodes} "
+                    f"seed={args.seed_base + episode_idx}",
+                    end="\r",
+                )
+            else:
                 print(
                     f"[long-horizon-eval] {task_name} episode "
-                    f"{episode_idx + 1}/{args.n_episodes} already exists; skipping",
+                    f"{episode_idx + 1}/{args.n_episodes}",
                     flush=True,
                 )
-                episode_results.append(existing_result)
-                save_stats(env_dir, episode_results)
-                continue
-        print(
-            f"[long-horizon-eval] {task_name} episode "
-            f"{episode_idx + 1}/{args.n_episodes}",
-            flush=True,
-        )
-        if args.overwrite:
-            clear_episode_artifacts(episode_dir)
-        episode_result = run_one_episode(
-            args=args,
-            task_name=task_name,
-            plan=plan,
-            verifier=verifier,
-            policy_adapter=policy_adapter,
-            episode_dir=episode_dir,
-        )
-        episode_result["episode_index"] = episode_idx
-        episode_result["status"] = "completed"
-        save_episode_stats(episode_dir, episode_result)
-        episode_results.append(episode_result)
-        save_stats(env_dir, episode_results)
+            if args.overwrite:
+                clear_episode_artifacts(episode_dir)
+            episode_result = run_one_episode(
+                args=args,
+                task_name=task_name,
+                plan=plan,
+                verifier=verifier,
+                policy_adapter=policy_adapter,
+                episode_dir=episode_dir,
+                episode_index=episode_idx,
+            )
+            episode_result["episode_index"] = episode_idx
+            episode_result["status"] = "completed"
+            save_episode_stats(episode_dir, episode_result)
+            episode_results.append(episode_result)
+            save_stats(env_dir, episode_results)
+            episode_progress.update(1)
+            success_count = sum(
+                bool(result.get("env_success", False))
+                for result in episode_results
+            )
+            episode_progress.set_postfix(
+                success=f"{success_count}/{episode_progress.n}",
+                last="ok" if episode_result.get("env_success", False) else "fail",
+            )
 
-    success_values = [float(result["env_success"]) for result in episode_results]
-    success_rate = float(np.mean(success_values)) if success_values else 0.0
-    save_stats(env_dir, episode_results)
-    return {
-        "task_name": task_name,
-        "task_instruction": task_instruction,
-        "env_success": success_rate > 0.0,
-        "success_rate": success_rate,
-        "status": "completed",
-        "output_dir": str(env_dir),
-        "episode_results": episode_results,
-        "elapsed_sec": time.perf_counter() - start,
-    }
+        success_values = [float(result["env_success"]) for result in episode_results]
+        success_rate = float(np.mean(success_values)) if success_values else 0.0
+        save_stats(env_dir, episode_results)
+        episode_progress.set_postfix(
+            success=f"{sum(bool(value) for value in success_values)}/{len(success_values)}",
+            rate=f"{success_rate:.1%}",
+        )
+        return {
+            "task_name": task_name,
+            "task_instruction": task_instruction,
+            "env_success": success_rate > 0.0,
+            "success_rate": success_rate,
+            "status": "completed",
+            "output_dir": str(env_dir),
+            "episode_results": episode_results,
+            "elapsed_sec": time.perf_counter() - start,
+        }
+    finally:
+        close_episode_progress()
 
 
 def parse_args() -> argparse.Namespace:
@@ -480,6 +566,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tasks", nargs="*", default=None)
     parser.add_argument("--max-tasks", type=int, default=0)
     parser.add_argument("--n-episodes", type=int, default=1)
+    parser.add_argument(
+        "--seed-base",
+        type=int,
+        default=1000,
+        help="Episode seeds are seed_base + episode_index.",
+    )
     parser.add_argument("--split", default="target", choices=["pretrain", "target"])
     parser.add_argument("--model-path", default=MODEL_PATH)
     parser.add_argument(
@@ -489,6 +581,16 @@ def parse_args() -> argparse.Namespace:
         help="Base VLA implementation used by the long-horizon controller.",
     )
     parser.add_argument("--aux-head-path", default=AUX_HEAD_PATH)
+    parser.add_argument(
+        "--xiaomi-aux-head-path",
+        default="",
+        help="Xiaomi-specific auxiliary head directory; ignored for GR00T.",
+    )
+    parser.add_argument(
+        "--observation-history-offsets",
+        default="auto",
+        help="History offsets shared by the simulator, policy transform, and auxiliary head.",
+    )
     parser.add_argument(
         "--xiaomi-history-length",
         type=int,
@@ -509,17 +611,41 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-config", default="panda_omron")
     parser.add_argument("--embodiment-tag", default="new_embodiment")
+    parser.add_argument(
+        "--policy-language-mode",
+        choices=["full_task_and_subtask", "subtask_only"],
+        default="full_task_and_subtask",
+        help="Language sent to the VLA policy at each control step.",
+    )
     parser.add_argument("--planner", default="ollama", choices=["api", "ollama", "static"])
     parser.add_argument("--planner-fallback-static", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--plan-cache-dir", default="")
     parser.add_argument("--overwrite-plan", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
-    parser.add_argument("--verifier", default="ollama_vl", choices=["qwen_vl", "ollama_vl", "dry"])
+    parser.add_argument(
+        "--verifier",
+        default="ollama_vl",
+        choices=["qwen_vl", "ollama_vl", "api_vl", "dry"],
+    )
     parser.add_argument("--dry-vlm-status", default="complete")
     parser.add_argument("--vlm-model-path", default=DEFAULT_QWEN3_VL_PATH)
     parser.add_argument("--vlm-ollama-model", default="qwen3-vl:8b")
     parser.add_argument("--vlm-ollama-base-url", default="http://localhost:11434")
     parser.add_argument("--vlm-ollama-keep-alive", default="30m")
+    parser.add_argument("--vlm-api-model", default="gpt-5.6-sol")
+    parser.add_argument(
+        "--vlm-api-base-url",
+        default="",
+        help="OpenAI-compatible base URL; defaults to OPENAI_BASE_URL.",
+    )
+    parser.add_argument(
+        "--vlm-api-reasoning-effort",
+        default="",
+        help="Optional provider-supported Chat Completions reasoning_effort value.",
+    )
+    parser.add_argument("--vlm-api-max-completion-tokens", type=int, default=256)
+    parser.add_argument("--vlm-api-max-retries", type=int, default=4)
+    parser.add_argument("--vlm-api-retry-delay-sec", type=float, default=15.0)
     parser.add_argument("--vlm-timeout-sec", type=float, default=120.0)
     parser.add_argument("--vlm-num-predict", type=int, default=1024)
     parser.add_argument(
@@ -555,13 +681,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aux-retry-confidence-threshold", type=float, default=0.6)
     parser.add_argument("--aux-success-confidence-threshold", type=float, default=0.7)
     parser.add_argument("--aux-cooldown-steps", type=int, default=8)
+    parser.add_argument(
+        "--aux-min-steps-before-trigger",
+        type=int,
+        default=8,
+        help="Minimum executed control steps before the auxiliary head may trigger the VLM.",
+    )
     parser.add_argument("--annotate-videos", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show task and episode progress bars.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    args.observation_history_offsets = resolve_observation_history_offsets(
+        args.aux_head_path,
+        args.observation_history_offsets,
+    )
+    print(
+        "[long-horizon-eval] online observation history offsets="
+        f"{args.observation_history_offsets}",
+        flush=True,
+    )
     task_names = args.tasks or list(TASK_SET_REGISTRY[args.task_set])
     if args.max_tasks:
         task_names = task_names[: args.max_tasks]
@@ -607,20 +754,18 @@ def main() -> None:
     verifier = make_verifier(args)
 
     if args.policy_backend == "xiaomi":
-        if args.aux_head_path:
-            print(
-                "[long-horizon-eval] INFO Xiaomi backend does not use the GR00T "
-                "auxiliary checkpoint; ignoring --aux-head-path.",
-                flush=True,
-            )
         policy_adapter = XiaomiPolicyAdapter(
             model_path=args.model_path,
             history_length=args.xiaomi_history_length,
             action_steps=args.n_action_steps,
             num_diffusion_steps=args.xiaomi_num_diffusion_steps,
+            aux_head_path=args.xiaomi_aux_head_path,
         )
     else:
-        data_config = DATA_CONFIG_MAP[args.data_config]
+        data_config = configured_data_config(
+            args.data_config,
+            args.observation_history_offsets,
+        )
         modality_config = data_config.modality_config()
         policy = Gr00tPolicy(
             model_path=args.model_path,
@@ -635,8 +780,20 @@ def main() -> None:
             aux_head_path=args.aux_head_path,
         )
     rows: list[dict[str, Any]] = []
-    for task_name in task_names:
-        print(f"[long-horizon-eval] Running {task_name}", flush=True)
+    task_progress = tqdm(
+        task_names,
+        desc="Tasks",
+        unit="task",
+        dynamic_ncols=True,
+        leave=True,
+        disable=not args.progress,
+    )
+    for task_name in task_progress:
+        task_progress.set_postfix(current=task_name)
+        if args.progress:
+            tqdm.write(f"[long-horizon-eval] Running {task_name}")
+        else:
+            print(f"[long-horizon-eval] Running {task_name}", flush=True)
         try:
             row = run_one_task(
                 args=args,
@@ -658,14 +815,21 @@ def main() -> None:
             print(f"[long-horizon-eval] ERROR {task_name}: {exc}", flush=True)
         rows.append(row)
         save_batch_results(output_root, rows)
-        print(
+        message = (
             f"[long-horizon-eval] {task_name}: status={row['status']} "
-            f"success_rate={row.get('success_rate', float(row['env_success']))}",
-            flush=True,
+            f"success_rate={row.get('success_rate', float(row['env_success']))}"
         )
+        if args.progress:
+            tqdm.write(message)
+        else:
+            print(message, flush=True)
 
     save_batch_results(output_root, rows)
-    print(f"Saved long-horizon composite eval outputs to {output_root}", flush=True)
+    if args.progress:
+        tqdm.write(f"Saved long-horizon composite eval outputs to {output_root}")
+        task_progress.close()
+    else:
+        print(f"Saved long-horizon composite eval outputs to {output_root}", flush=True)
 
 
 if __name__ == "__main__":

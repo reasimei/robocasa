@@ -34,6 +34,7 @@ class ControllerConfig:
     vlm_history_interval_sec: float = 1.0
     save_vlm_frames: bool = False
     max_rollback_chunks: int = 8
+    policy_language_mode: str = "full_task_and_subtask"
 
 
 @dataclass
@@ -191,6 +192,14 @@ class LongHorizonController:
         return observation, global_step, env_success, executed, done
 
     def policy_instruction(self, subtask: SubtaskSpec) -> str:
+        if self.config.policy_language_mode == "subtask_only":
+            return subtask.instruction
+        if self.config.policy_language_mode != "full_task_and_subtask":
+            raise ValueError(
+                "Unsupported policy_language_mode="
+                f"{self.config.policy_language_mode!r}; expected 'subtask_only' "
+                "or 'full_task_and_subtask'."
+            )
         if not self.plan.task_instruction:
             return subtask.instruction
         return (

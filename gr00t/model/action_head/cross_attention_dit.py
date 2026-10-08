@@ -35,8 +35,8 @@ class TimestepEncoder(nn.Module):
         self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
 
     def forward(self, timesteps):
-        dtype = next(self.parameters()).dtype
-        timesteps_proj = self.time_proj(timesteps).to(dtype)
+        dtype = getattr(getattr(self.timestep_embedder, "linear_1", None), "weight", timesteps).dtype
+        timesteps_proj = self.time_proj(timesteps.float()).to(dtype)
         timesteps_emb = self.timestep_embedder(timesteps_proj)  # (N, D)
         return timesteps_emb
 

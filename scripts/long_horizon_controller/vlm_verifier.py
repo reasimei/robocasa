@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import copy
 import re
 import subprocess
 import tempfile
@@ -35,88 +37,27 @@ DEFAULT_QWEN3_VL_PATH = (
 )
 
 
-VLM_PROMPT_TEMPLATE = """You are a robot execution verifier for long-horizon manipulation.
-
-Given the image sequence and task states, decide whether the current subtask is complete,
-still progressing, or failed.
-
-## Decision Procedure
-
-First evaluate two booleans independently:
-
-1. finish_state_satisfied:
-- Check ONLY `Current expected finish state`.
-- True only if required finish state is visibly satisfied.
-- Do not use next subtask or overall task goal.
-
-2. next_start_plausible:
-- Check ONLY `Next subtask expected start state`.
-- True if the required starting condition is visibly satisfied or physically plausible.
-- If no next subtask exists, set True.
-
-Then decide:
-
-- complete:
-  finish_state_satisfied=True AND next_start_plausible=True
-
-- in_progress:
-  finish_state_satisfied=False OR next_start_plausible=False AND the robot is clearly making progress toward it.
-
-- failed:
-  finish_state_satisfied=False OR next_start_plausible=False AND progress is not credible or recovery is needed.
-
-Do NOT mark in_progress only because:
-- the robot still holds an object,
-- more subtasks remain,
-- the whole task is unfinished.
-
-Example:
-If the finish state is "robot holds the pan" and the robot holds the pan,
-the subtask is complete.
-
-## Failure Types
-
-Use:
-none | wrong_object | wrong_target | wrong_affordance | wrong_pose |
-object_dropped | unstable_grasp | state_mismatch | blocked |
-unreachable | unknown
-
-Typical failed cases:
-- wrong object/target/affordance
-- incorrect gripper pose (Typically, the gripper should remain open when not grasping anything.)
-- dropped object
-- unstable grasp
-- blocked or unreachable motion
-- repeated ineffective actions
-- inexplicable twitching
+VLM_PROMPT_TEMPLATE = """## Role
+You are the slow, high-reliability visual verifier for a robot executing a
+long-horizon manipulation plan. Judge the current subtask from visible evidence.
 
 ## Input
+Full task: {task_instruction}
 
-Full task:
-{task_instruction}
-
-Current subtask:
-{current_instruction}
-
-Current expected start state:
-{current_start}
-
-Current expected finish state:
-{current_finish}
-
-Next subtask expected start state:
-{next_start}
+Current subtask: {current_instruction}
+Current expected start state: {current_start}
+Current expected finish state: {current_finish}
+Next subtask expected start state: {next_start}
 
 State transition check:
 {state_check}
 
-Controller context:
-{controller_context}
+Controller context: {controller_context}
 
 Image context:
 {image_context}
 
-Images:
+Images order:
 1. agentview_left, previous timestep
 2. eye_in_hand, previous timestep
 3. agentview_left, current timestep
@@ -126,22 +67,36 @@ Images 1&3 and 2&4 show temporal change.
 Images at the same timestep are complementary views.
 Use temporal pairs for progress and current views for state verification.
 
-## Output
+Then choose one status:
+- `complete` only when both booleans are true.
+- `in_progress` when a required condition is not yet true but the robot is
+  credibly progressing toward it.
+- `failed` when a required condition is not true and progress is not credible,
+  or recovery is needed before the current subtask can continue.
 
-Return ONLY valid JSON:
+## Rules
+- Use visual evidence only. Do not infer hidden state or assume an action worked.
+- Do not use the overall task or later subtasks to decide the current finish state.
+- Do not mark `in_progress` merely because the robot holds an object, later
+  subtasks remain, or the full task is unfinished. For example, if the finish
+  state is "robot holds the pan" and it visibly holds the pan, this subtask is complete.
+- Use `none` as `failure_type` unless the status is `failed`.
+- For `failed`, use one of: `wrong_object`, `wrong_target`,
+  `wrong_affordance`, `wrong_pose`, `object_dropped`, `unstable_grasp`,
+  `state_mismatch`, `blocked`, `unreachable`, or `unknown`.
+- A negative state requirement such as "not holding an object" is satisfied
+  when that condition is visibly absent.
+- Keep the rationale to one short, evidence-based sentence.
 
+## Output Format
+Return ONLY one valid JSON object. Do not include markdown or analysis.
 {{
-    "status":"complete | in_progress | failed",
-    "failure_type":"none | wrong_object | wrong_target | wrong_affordance | wrong_pose | object_dropped | unstable_grasp | state_mismatch | blocked | unreachable | unknown",
-    "finish_state_satisfied":true | false,
-    "next_start_plausible":true | false,
-    "rationale":"brief evidence-based explanation"
+  "status":"complete | in_progress | failed",
+  "failure_type":"none | wrong_object | wrong_target | wrong_affordance | wrong_pose | object_dropped | unstable_grasp | state_mismatch | blocked | unreachable | unknown",
+  "finish_state_satisfied":true,
+  "next_start_plausible":true,
+  "rationale":"brief visual evidence"
 }}
-
-Constraints:
-- Use only visual evidence.
-- Keep rationale concise.
-- Output JSON only.
 """
 
 
@@ -277,6 +232,7 @@ Return ONLY valid JSON. Do not include the thought process.
 - Return JSON only.
 """
 
+
 def extract_json_object(text: str) -> dict[str, Any]:
     text = text.strip()
     if text.startswith("```"):
@@ -358,6 +314,43 @@ VLM_DECISION_JSON_SCHEMA: dict[str, Any] = VLMDecisionResponse.model_json_schema
 RECOVERY_JSON_SCHEMA: dict[str, Any] = RecoveryResponse.model_json_schema()
 
 
+def _strict_openai_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Make a Pydantic schema acceptable to strict OpenAI-compatible gateways.
+
+    Strict structured outputs require every object property to appear in its
+    ``required`` array, including fields represented in Pydantic by a default
+    value (for example recovery-subtask ``notes``).
+    """
+    result = copy.deepcopy(schema)
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            properties = node.get("properties")
+            if isinstance(properties, dict):
+                node["required"] = list(properties)
+                node["additionalProperties"] = False
+                for child in properties.values():
+                    visit(child)
+            for key in ("items", "contains", "if", "then", "else"):
+                if key in node:
+                    visit(node[key])
+            if "$defs" in node:
+                for definition in node["$defs"].values():
+                    visit(definition)
+            for child in node.get("anyOf", []):
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(result)
+    return result
+
+
+VLM_DECISION_JSON_SCHEMA = _strict_openai_schema(VLM_DECISION_JSON_SCHEMA)
+RECOVERY_JSON_SCHEMA = _strict_openai_schema(RECOVERY_JSON_SCHEMA)
+
+
 def image_from_any(image: Any) -> Image.Image:
     if isinstance(image, (list, tuple)):
         if not image:
@@ -407,9 +400,7 @@ def image_context_text(
         for index, offset in enumerate(timestamps_sec, start=1):
             camera = image_labels[index - 1]
             role = "current" if abs(offset) < 1e-9 else "historical"
-            labels.append(
-                f"Image {index}: {camera}, {role}, relative time {offset:+.3f}s"
-            )
+            labels.append(f"Image {index}: {camera}, {role}, relative time {offset:+.3f}s")
         timing = "\n".join(labels)
         return (
             f"{num_images} images are supplied separately in the message images array. "
@@ -710,9 +701,7 @@ class LocalQwenVLVerifier:
             current_payload["vlm_image_timestamps_sec"] = getattr(
                 current_subtask, "vlm_image_timestamps_sec", None
             )
-            current_payload["vlm_image_labels"] = getattr(
-                current_subtask, "vlm_image_labels", None
-            )
+            current_payload["vlm_image_labels"] = getattr(current_subtask, "vlm_image_labels", None)
             request_path.write_text(
                 json.dumps(
                     {
@@ -807,6 +796,191 @@ class LocalQwenVLVerifier:
 
 
 @dataclass
+class OpenAIVLVerifier:
+    """OpenAI-compatible Chat Completions verifier for the slow controller."""
+
+    model: str = "gpt-5.6-sol"
+    base_url: str | None = None
+    api_key: str | None = None
+    timeout_sec: float = 300.0
+    max_completion_tokens: int = 256
+    reasoning_effort: str | None = None
+    max_retries: int = 2
+    retry_delay_sec: float = 10.0
+    supports_image_history: bool = True
+
+    def __post_init__(self) -> None:
+        self.base_url = (
+            self.base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        ).rstrip("/")
+        self.api_key = self.api_key or os.environ.get("OPENAI_API_KEY")
+        if not self.api_key:
+            raise ValueError("Set OPENAI_API_KEY or pass api_key for the API VLM verifier.")
+
+    def verify(
+        self,
+        image: Any,
+        current_subtask: SubtaskSpec,
+        next_subtask: SubtaskSpec | None = None,
+    ) -> VLMDecision:
+        images = images_from_any(image)
+        prompt = format_vlm_prompt(current_subtask, next_subtask, num_images=len(images))
+        verify_start = time.perf_counter()
+        response_payload = self._chat(images, prompt, VLM_DECISION_JSON_SCHEMA)
+        decision = self._decision_from_payload(response_payload, require_status=True)
+        if decision is None:
+            repair_prompt = (
+                "Repair the previous response. Return exactly one JSON object satisfying the "
+                "requested schema, with no markdown or analysis.\n\n"
+                f"Original prompt:\n{prompt}"
+            )
+            retry_payload = self._chat(images, repair_prompt, VLM_DECISION_JSON_SCHEMA)
+            decision = self._decision_from_payload(retry_payload, require_status=True)
+            response_payload = retry_payload
+        decision = finalize_vlm_decision(
+            decision,
+            has_next_subtask=next_subtask is not None,
+        )
+        if decision is None:
+            decision = unparseable_vlm_decision(
+                str(response_payload.get("message", {}).get("content", ""))
+            )
+        decision.timings.update(self._timings_from_response(response_payload))
+
+        if decision.status == VLMStatus.FAILED and decision.recovery_mode == RecoveryMode.NONE:
+            recovery_start = time.perf_counter()
+            recovery_payload = self._chat(
+                images,
+                format_recovery_prompt(
+                    current_subtask,
+                    next_subtask,
+                    num_images=len(images),
+                    failure_type=decision.failure_type,
+                    rationale=decision.rationale,
+                ),
+                RECOVERY_JSON_SCHEMA,
+            )
+            recovery = self._decision_from_payload(recovery_payload, require_status=False)
+            decision.timings["recovery_request_sec"] = time.perf_counter() - recovery_start
+            decision.timings.update(
+                {
+                    f"recovery_{key}": value
+                    for key, value in self._timings_from_response(recovery_payload).items()
+                }
+            )
+            if recovery and (
+                recovery.recovery_mode != RecoveryMode.NONE or recovery.recovery_subtasks
+            ):
+                decision.recovery_mode = recovery.recovery_mode
+                decision.rollback_steps = recovery.rollback_steps
+                decision.recovery_subtasks = recovery.recovery_subtasks
+                decision.rationale = recovery.rationale or decision.rationale
+                decision.raw_response = (
+                    f"{decision.raw_response}\n\nRECOVERY_RESPONSE:\n{recovery.raw_response}"
+                )
+        decision.timings["total_verify_sec"] = time.perf_counter() - verify_start
+        return decision
+
+    @staticmethod
+    def _decision_from_payload(
+        payload: dict[str, Any], require_status: bool = True
+    ) -> VLMDecision | None:
+        content = str(payload.get("message", {}).get("content", ""))
+        if not content.strip():
+            return None
+        try:
+            return strict_decision_from_text(content, require_status=require_status)
+        except (json.JSONDecodeError, ValidationError):
+            return None
+
+    def _chat(
+        self,
+        images: list[Image.Image],
+        prompt: str,
+        response_format: dict[str, Any],
+    ) -> dict[str, Any]:
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        content.extend(
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64," + image_to_base64_png(image)},
+            }
+            for image in images
+        )
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a JSON-only robot visual verifier. Return exactly one valid "
+                        "JSON object and no analysis or markdown."
+                    ),
+                },
+                {"role": "user", "content": content},
+            ],
+            "max_completion_tokens": self.max_completion_tokens,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "vlm_response",
+                    "strict": True,
+                    "schema": response_format,
+                },
+            },
+        }
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+        request = urllib.request.Request(
+            url=f"{self.base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        # Honor HTTP(S)_PROXY, which is required for some OpenAI-compatible relays.
+        opener = urllib.request.build_opener()
+        # Some OpenAI-compatible relays transiently surface upstream failures as 403.
+        # Keep retries finite: persistent authorization/model-access errors still fail.
+        retryable_codes = {403, 429, 500, 502, 503, 504}
+        for attempt in range(max(0, self.max_retries) + 1):
+            try:
+                with opener.open(request, timeout=self.timeout_sec) as response:
+                    raw = json.loads(response.read().decode("utf-8"))
+                message = raw.get("choices", [{}])[0].get("message", {})
+                return {
+                    "message": {"content": str(message.get("content", ""))},
+                    "usage": raw.get("usage", {}),
+                }
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                error = RuntimeError(f"API VLM verifier failed: HTTP {exc.code}\n{detail}")
+                retryable = exc.code in retryable_codes
+            except (urllib.error.URLError, TimeoutError) as exc:
+                error = RuntimeError(f"API VLM verifier request failed: {exc}")
+                retryable = True
+            if not retryable or attempt >= self.max_retries:
+                raise error
+            time.sleep(self.retry_delay_sec * (2**attempt))
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _timings_from_response(payload: dict[str, Any]) -> dict[str, float]:
+        usage = payload.get("usage", {}) or {}
+        timings: dict[str, float] = {}
+        for source, target in (
+            ("prompt_tokens", "api_prompt_tokens"),
+            ("completion_tokens", "api_completion_tokens"),
+            ("total_tokens", "api_total_tokens"),
+        ):
+            if source in usage:
+                timings[target] = float(usage[source])
+        return timings
+
+
+@dataclass
 class OllamaVLVerifier:
     model: str = "qwen3-vl:8b"
     base_url: str = "http://localhost:11434"
@@ -838,11 +1012,11 @@ class OllamaVLVerifier:
                 "You must repair the previous response.\n"
                 "Return exactly ONE minified JSON object and nothing else.\n"
                 "No markdown. No prose. No analysis.\n"
-                "Schema: {\"status\":\"complete|in_progress|failed\","
-                "\"failure_type\":\"none|wrong_object|wrong_target|wrong_affordance|wrong_pose|"
-                "object_dropped|unstable_grasp|state_mismatch|blocked|unreachable|unknown\","
-                "\"finish_state_satisfied\":true,\"next_start_plausible\":true,"
-                "\"rationale\":\"brief visual reason\"}\n"
+                'Schema: {"status":"complete|in_progress|failed",'
+                '"failure_type":"none|wrong_object|wrong_target|wrong_affordance|wrong_pose|'
+                'object_dropped|unstable_grasp|state_mismatch|blocked|unreachable|unknown",'
+                '"finish_state_satisfied":true,"next_start_plausible":true,'
+                '"rationale":"brief visual reason"}\n'
                 "Set both booleans from the images first. "
                 "If a next subtask exists, status is complete only when BOTH booleans are true. "
                 "If there is no next subtask, set next_start_plausible=true and use "
@@ -905,12 +1079,9 @@ class OllamaVLVerifier:
                     for key, value in self._timings_from_response(recovery_payload).items()
                 }
             )
-            if (
-                recovery_decision is not None
-                and (
-                    recovery_decision.recovery_mode != RecoveryMode.NONE
-                    or recovery_decision.recovery_subtasks
-                )
+            if recovery_decision is not None and (
+                recovery_decision.recovery_mode != RecoveryMode.NONE
+                or recovery_decision.recovery_subtasks
             ):
                 decision.recovery_mode = recovery_decision.recovery_mode
                 decision.rollback_steps = recovery_decision.rollback_steps
@@ -972,7 +1143,7 @@ class OllamaVLVerifier:
                     "role": "user",
                     "content": prompt,
                     "images": [image_to_base64_png(image) for image in images],
-                }
+                },
             ],
         }
         request = urllib.request.Request(
@@ -981,7 +1152,7 @@ class OllamaVLVerifier:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener()
         try:
             with opener.open(request, timeout=self.timeout_sec) as response:
                 return json.loads(response.read().decode("utf-8"))
@@ -1108,7 +1279,9 @@ def decision_from_payload(
     require_status: bool = True,
 ) -> VLMDecision:
     if require_status and "status" not in payload:
-        raise json.JSONDecodeError("Verifier JSON is missing status.", raw_response or str(payload), 0)
+        raise json.JSONDecodeError(
+            "Verifier JSON is missing status.", raw_response or str(payload), 0
+        )
     recovery = []
     for idx, item in enumerate(payload.get("recovery_subtasks", []) or []):
         if isinstance(item, dict):
@@ -1148,9 +1321,7 @@ def decision_from_payload(
     ).strip()
     if status != VLMStatus.FAILED:
         failure_type = "none"
-    raw_recovery_mode = str(
-        payload.get("recovery_mode", RecoveryMode.NONE.value)
-    ).strip().lower()
+    raw_recovery_mode = str(payload.get("recovery_mode", RecoveryMode.NONE.value)).strip().lower()
     try:
         recovery_mode = RecoveryMode(raw_recovery_mode)
     except ValueError:

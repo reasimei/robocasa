@@ -69,6 +69,7 @@ class XiaomiPolicyAdapter:
     model_path: str
     device: str = "cuda"
     dtype: Any = None
+    aux_head_path: str = ""
     history_length: int = 4
     action_steps: int = 16
     num_diffusion_steps: int = 5
@@ -78,6 +79,9 @@ class XiaomiPolicyAdapter:
     def __post_init__(self) -> None:
         import torch
         from transformers import AutoModel, AutoProcessor
+        from scripts.long_horizon_controller.xiaomi_aux_runtime import (
+            XiaomiAuxHeadRuntime,
+        )
 
         self.torch = torch
         self.dtype = self.dtype or torch.bfloat16
@@ -93,6 +97,8 @@ class XiaomiPolicyAdapter:
             attn_implementation="eager",
         ).to(self.device)
         self.model.eval()
+        self.aux_head = XiaomiAuxHeadRuntime(self.model, self.aux_head_path)
+        self.last_aux_output: dict[str, Any] | None = None
         self._images: dict[str, deque[np.ndarray]] = {
             key: deque(maxlen=self.history_length) for key in CAMERA_KEYS
         }
@@ -102,6 +108,7 @@ class XiaomiPolicyAdapter:
         for frames in self._images.values():
             frames.clear()
         self._states.clear()
+        self.last_aux_output = None
 
     def _state_vector(
         self,
@@ -232,11 +239,11 @@ class XiaomiPolicyAdapter:
             for video in videos
         ]
 
-    def act(
+    def _prepare_inputs(
         self,
         observation: dict[str, Any],
         instruction: str,
-    ) -> tuple[dict[str, Any], np.ndarray]:
+    ) -> dict[str, Any]:
         videos, state = self._observation_history(observation)
         inputs = self.processor(
             videos=self._crop_videos(videos),
@@ -245,16 +252,40 @@ class XiaomiPolicyAdapter:
             state=state,
             robot_type="robocasa365",
         )
-        inputs = {
+        return {
             key: value.to(self.device)
             if hasattr(value, "to")
             else value
             for key, value in inputs.items()
         }
+
+    def _forward_vlm(self, inputs: dict[str, Any]) -> Any:
+        vlm_inputs = {
+            key: value
+            for key, value in inputs.items()
+            if key not in {"state", "action_mask"}
+        }
+        return self.model.vlm(**vlm_inputs, use_cache=True)
+
+    def act(
+        self,
+        observation: dict[str, Any],
+        instruction: str,
+    ) -> tuple[dict[str, Any], np.ndarray]:
         with self.torch.inference_mode():
+            inputs = self._prepare_inputs(observation, instruction)
+            vlm_outputs = self._forward_vlm(inputs)
+            if self.aux_head.enabled:
+                self.last_aux_output = self.aux_head.predict(
+                    vlm_outputs,
+                    inputs["attention_mask"],
+                )
+            else:
+                self.last_aux_output = None
             output = self.model(
                 **inputs,
                 num_steps=self.num_diffusion_steps,
+                vlm_outputs=vlm_outputs,
             )
         actions = self.processor.decode_action(
             output.actions,

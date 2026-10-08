@@ -19,3 +19,15 @@ WARNING: OpenGL error 0x501 in or before mjr_makeContext
 Wed Aug 26 10:54:52 2026
 WARNING: OpenGL error 0x501 in or before mjr_makeContext
 
+Thu Aug 27 16:11:23 2026
+WARNING: OpenGL error 0x501 in or before mjr_makeContext
+
+Thu Aug 27 16:23:46 2026
+WARNING: OpenGL error 0x501 in or before mjr_makeContext
+
+Thu Aug 27 16:35:43 2026
+WARNING: OpenGL error 0x501 in or before mjr_makeContext
+
+Mon Aug 31 17:39:49 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 84. The simulation is unstable. Time = 37.1740.
+

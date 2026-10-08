@@ -41,6 +41,8 @@ class CategorySpecificLinear(nn.Module):
     def forward(self, x, cat_ids):
         selected_W = self.W[cat_ids]
         selected_b = self.b[cat_ids]
+        if x.dtype != selected_W.dtype:
+            x = x.to(dtype=selected_W.dtype)
         return torch.bmm(x, selected_W) + selected_b.unsqueeze(1)
 
 
@@ -265,6 +267,11 @@ class FlowmatchingActionHead(nn.Module):
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
+        # Checkpoints loaded with mixed frozen/trainable modules can return
+        # float32 backbone activations while the action head is bfloat16.
+        # Align activations with the LayerNorm parameters before normalization.
+        if hasattr(self.vlln, "weight") and backbone_features.dtype != self.vlln.weight.dtype:
+            backbone_features = backbone_features.to(dtype=self.vlln.weight.dtype)
         backbone_features = self.vlln(backbone_features)
         backbone_features = self.vl_self_attention(backbone_features)
         backbone_output["backbone_features"] = backbone_features
@@ -303,10 +310,16 @@ class FlowmatchingActionHead(nn.Module):
         embodiment_id = action_input.embodiment_id
 
         # Embed state.
+        state_dtype = next(iter(self.parameters()), action_input.state).dtype
+        if action_input.state.dtype != state_dtype:
+            action_input.state = action_input.state.to(dtype=state_dtype)
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
         # Embed noised action trajectory.
         actions = action_input.action
+        action_dtype = next(iter(self.parameters()), actions).dtype
+        if actions.dtype != action_dtype:
+            actions = actions.to(dtype=action_dtype)
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast

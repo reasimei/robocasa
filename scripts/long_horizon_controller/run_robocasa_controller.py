@@ -5,12 +5,17 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 
+import numpy as np
 import tyro
 
 from .controller import ControllerConfig, LongHorizonController
 from .fast_monitor import ActionEntropyMonitor, AuxHeadFusionMonitor
 from .planner import OllamaPlanner, OpenAICompatiblePlanner, StaticPlanner
-from .policy_adapters import Gr00tPolicyAdapter
+from .policy_adapters import (
+    Gr00tPolicyAdapter,
+    configured_data_config,
+    resolve_observation_history_offsets,
+)
 from .robocasa_adapter import RobocasaVectorEnvAdapter
 from .schemas import FastMonitorConfig, VLMStatus, plan_from_dict
 from .vlm_verifier import DEFAULT_QWEN3_VL_PATH, DryRunVerifier, LocalQwenVLVerifier, OllamaVLVerifier
@@ -29,6 +34,7 @@ class Args:
         "/data/zjw/workspace/Isaac-GR00T/expdata/aux_progress/"
         "atomic_retry_3class_history_run1/checkpoint-8000"
     )
+    observation_history_offsets: str = "auto"
     output_dir: str = "/data/zjw/workspace/Isaac-GR00T/expdata/long_horizon_controller/robocasa_run"
     split: str = "target"
     data_config: str = "panda_omron"
@@ -96,7 +102,6 @@ def _make_verifier(args: Args):
 
 def main(args: Args) -> None:
     from gr00t.eval.simulation import MultiStepConfig, SimulationConfig, VideoConfig
-    from gr00t.experiment.data_config import DATA_CONFIG_MAP
     from gr00t.model.policy import Gr00tPolicy
 
     if args.plan_json_path:
@@ -106,7 +111,11 @@ def main(args: Args) -> None:
         plan = planner.plan(args.task)
     plan.save(f"{args.output_dir}/plan.json")
 
-    data_config = DATA_CONFIG_MAP[args.data_config]
+    history_offsets = resolve_observation_history_offsets(
+        args.aux_head_path,
+        args.observation_history_offsets,
+    )
+    data_config = configured_data_config(args.data_config, history_offsets)
     modality_config = data_config.modality_config()
     policy = Gr00tPolicy(
         model_path=args.model_path,
@@ -129,6 +138,8 @@ def main(args: Args) -> None:
         n_envs=1,
         video=VideoConfig(video_dir=f"{args.output_dir}/videos"),
         multistep=MultiStepConfig(
+            video_delta_indices=np.asarray(history_offsets, dtype=np.int64),
+            state_delta_indices=np.asarray(history_offsets, dtype=np.int64),
             n_action_steps=args.n_action_steps,
             max_episode_steps=args.max_episode_steps,
         ),

@@ -86,6 +86,7 @@ class Args:
     embodiment_tag: str = "new_embodiment"
     video_backend: str = "opencv"
     batch_size: int = 32
+    gradient_accumulation_steps: int = 1
     max_steps: int = 20000
     save_steps: int = 500
     save_total_limit: int = 10
@@ -408,22 +409,30 @@ class GTBestEvalAuxTrainer(AuxTrainer):
         if checkpoint_key in self._launched_eval_checkpoints:
             return
 
-        metrics = self._evaluate_gt_validation()
-        payload = {
-            "global_step": int(self.state.global_step),
-            "checkpoint": checkpoint_dir.name,
-            **metrics,
-        }
-        with (checkpoint_dir / "eval_val.json").open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-
-        self.log(
-            {
-                f"eval/{key}": value
-                for key, value in metrics.items()
-                if isinstance(value, (int, float))
+        # Under torchrun every rank enters this method. Only rank 0 should
+        # evaluate/write the shared JSON; all ranks then synchronize before
+        # continuing so a later save cannot race with evaluation/pruning.
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        is_main = self.is_world_process_zero()
+        if is_main:
+            metrics = self._evaluate_gt_validation()
+            payload = {
+                "global_step": int(self.state.global_step),
+                "checkpoint": checkpoint_dir.name,
+                **metrics,
             }
-        )
+            with (checkpoint_dir / "eval_val.json").open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+
+            self.log(
+                {
+                    f"eval/{key}": value
+                    for key, value in metrics.items()
+                    if isinstance(value, (int, float))
+                }
+            )
+        if distributed:
+            torch.distributed.barrier()
         self._launched_eval_checkpoints.add(checkpoint_key)
 
 
@@ -683,6 +692,8 @@ def main(args: Args) -> None:
         warmup_ratio=args.warmup_ratio,
         max_steps=args.max_steps,
         num_train_epochs=100,
+        gradient_accumulation_steps=max(int(args.gradient_accumulation_steps), 1),
+        ddp_find_unused_parameters=False,
         save_steps=args.save_steps,
         save_strategy="steps",
         # GTBestEvalAuxTrainer prunes after evaluating the just-saved checkpoint.

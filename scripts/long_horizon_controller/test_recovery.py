@@ -109,7 +109,7 @@ def test_rollback_action_handles_singleton_batch() -> None:
     )
     np.testing.assert_array_equal(
         reversed_action["action.end_effector_position"],
-        np.asarray([[-4, -5], [-2, -3], [0, -1]], dtype=np.float32),
+        np.asarray([[[-4, -5], [-2, -3], [0, -1]]], dtype=np.float32),
     )
     np.testing.assert_array_equal(
         reversed_action["action.gripper_close"],

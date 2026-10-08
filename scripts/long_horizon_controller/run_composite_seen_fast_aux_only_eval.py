@@ -19,12 +19,15 @@ from robocasa.utils.dataset_registry import TASK_SET_REGISTRY
 from robocasa.utils.dataset_registry_utils import get_task_horizon
 
 from gr00t.eval.simulation import MultiStepConfig, SimulationConfig, VideoConfig
-from gr00t.experiment.data_config import DATA_CONFIG_MAP
 from gr00t.model.policy import Gr00tPolicy
 
 from scripts.long_horizon_controller.controller import ControllerConfig, LongHorizonController
 from scripts.long_horizon_controller.fast_monitor import ActionEntropyMonitor
-from scripts.long_horizon_controller.policy_adapters import Gr00tPolicyAdapter
+from scripts.long_horizon_controller.policy_adapters import (
+    Gr00tPolicyAdapter,
+    configured_data_config,
+    resolve_observation_history_offsets,
+)
 from scripts.long_horizon_controller.robocasa_adapter import RobocasaVectorEnvAdapter
 from scripts.long_horizon_controller.run_composite_seen_eval import (
     DEFAULT_TASK_INSTRUCTIONS,
@@ -333,6 +336,7 @@ def run_one_episode(
     episode_dir: Path,
 ) -> dict[str, Any]:
     max_episode_steps = args.max_episode_steps or get_task_horizon(task_name)
+    history_offsets = np.asarray(args.observation_history_offsets, dtype=np.int64)
     simulation_config = SimulationConfig(
         env_name=f"robocasa/{task_name}",
         split=args.split,
@@ -340,6 +344,8 @@ def run_one_episode(
         n_envs=1,
         video=VideoConfig(video_dir=str(episode_dir / "videos")),
         multistep=MultiStepConfig(
+            video_delta_indices=history_offsets,
+            state_delta_indices=history_offsets.copy(),
             n_action_steps=args.n_action_steps,
             max_episode_steps=max_episode_steps,
         ),
@@ -486,6 +492,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="target", choices=["pretrain", "target"])
     parser.add_argument("--model-path", default=MODEL_PATH)
     parser.add_argument("--aux-head-path", default=AUX_HEAD_PATH)
+    parser.add_argument(
+        "--observation-history-offsets",
+        default="auto",
+        help="History offsets shared by the simulator, policy transform, and auxiliary head.",
+    )
     parser.add_argument("--data-config", default="panda_omron")
     parser.add_argument("--embodiment-tag", default="new_embodiment")
     parser.add_argument("--planner", default="ollama", choices=["api", "ollama", "static"])
@@ -532,6 +543,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.observation_history_offsets = resolve_observation_history_offsets(
+        args.aux_head_path,
+        args.observation_history_offsets,
+    )
+    print(
+        "[fast-aux-only] online observation history offsets="
+        f"{args.observation_history_offsets}",
+        flush=True,
+    )
     task_names = args.tasks or list(TASK_SET_REGISTRY[args.task_set])
     if args.max_tasks:
         task_names = task_names[: args.max_tasks]
@@ -574,7 +594,10 @@ def main() -> None:
         print(f"Saved fast-aux-only composite plans to {output_root}", flush=True)
         return
 
-    data_config = DATA_CONFIG_MAP[args.data_config]
+    data_config = configured_data_config(
+        args.data_config,
+        args.observation_history_offsets,
+    )
     modality_config = data_config.modality_config()
     policy = Gr00tPolicy(
         model_path=args.model_path,

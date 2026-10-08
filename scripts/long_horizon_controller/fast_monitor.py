@@ -106,16 +106,25 @@ class AuxHeadFusionMonitor:
     retry_confidence_threshold: float = 0.6
     success_confidence_threshold: float = 0.7
     cooldown_steps: int = 8
+    min_steps_before_trigger: int = 8
 
     def __post_init__(self) -> None:
         self.reset()
 
     def reset(self) -> None:
         self.cooldown = 0
+        self.step_count = 0
 
     def fuse(self, entropy_signal: FastSignal, aux_output: dict[str, Any] | None = None) -> FastSignal:
+        self.step_count += 1
+        # Timeout is a controller safety bound and must not be hidden by a
+        # conflicting early auxiliary prediction.
+        if entropy_signal.trigger == FastTrigger.TIMEOUT:
+            return entropy_signal
         if self.cooldown > 0:
             self.cooldown -= 1
+            return entropy_signal
+        if self.step_count < self.min_steps_before_trigger:
             return entropy_signal
         if not aux_output:
             return entropy_signal

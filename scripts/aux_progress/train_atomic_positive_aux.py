@@ -37,6 +37,7 @@ from torch import nn
 from torch.utils.data import ConcatDataset, Dataset
 from transformers import BatchFeature, Trainer, TrainingArguments, set_seed
 from transformers.trainer_utils import SaveStrategy
+from accelerate.utils import DistributedDataParallelKwargs
 
 from gr00t.data.dataset import LeRobotSingleDataset
 from gr00t.data.embodiment_tags import EmbodimentTag
@@ -816,6 +817,37 @@ class GR00TAuxiliaryModel(nn.Module):
 
 
 class AuxTrainer(Trainer):
+    def _wrap_model(self, model, training=True, dataloader=None):
+        """Configure DDP for the frozen-backbone auxiliary graph.
+
+        Only the two auxiliary heads require gradients and their graph is
+        static on every step.  DDP's default unused-parameter traversal can
+        otherwise register reducer hooks twice for this custom model.
+        """
+        if training and torch.distributed.is_available() and torch.distributed.is_initialized():
+            self.args.ddp_find_unused_parameters = False
+            # Trainer._wrap_model creates/replaces this handler before
+            # Accelerator.prepare() constructs the actual DDP module.  Set it
+            # before calling the parent as well as after it, so the kwargs used
+            # by DDP are unambiguous across Transformers versions.
+            self.accelerator.ddp_handler = DistributedDataParallelKwargs(
+                find_unused_parameters=False,
+                static_graph=True,
+            )
+        wrapped = super()._wrap_model(model, training=training, dataloader=dataloader)
+        if training and torch.distributed.is_available() and torch.distributed.is_initialized():
+            self.accelerator.ddp_handler = DistributedDataParallelKwargs(
+                find_unused_parameters=False,
+                static_graph=True,
+            )
+            if self.is_world_process_zero():
+                print(
+                    "AuxTrainer DDP configuration: "
+                    "find_unused_parameters=False, static_graph=True",
+                    flush=True,
+                )
+        return wrapped
+
     def __init__(self, *args, **kwargs):
         self.external_eval_gpu = kwargs.pop("external_eval_gpu", None)
         self.external_eval_batch_size = kwargs.pop("external_eval_batch_size", 2)
@@ -870,8 +902,16 @@ class AuxTrainer(Trainer):
 
     def save_model(self, output_dir: str | None = None, _internal_call: bool = False):
         save_dir = output_dir or self.args.output_dir
-        if self.args.should_save:
-            self.model.save_pretrained(save_dir)
+        if not self.args.should_save:
+            return
+        if not self.is_world_process_zero():
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            return
+        model = self.accelerator.unwrap_model(self.model)
+        model.save_pretrained(save_dir)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     def _build_external_eval_command(self, checkpoint_dir: Path) -> list[str]:
         cmd = [
@@ -989,10 +1029,19 @@ class AuxTrainer(Trainer):
         return scored, unscored
 
     def _prune_checkpoints_by_eval(self) -> None:
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        if not self.is_world_process_zero():
+            if distributed:
+                torch.distributed.barrier()
+            return
         if self.checkpoint_retention_strategy != CHECKPOINT_RETENTION_BEST_EVAL:
+            if distributed:
+                torch.distributed.barrier()
             return
         keep_n = max(int(self.best_checkpoint_keep_n), 0)
         if keep_n <= 0:
+            if distributed:
+                torch.distributed.barrier()
             return
 
         scored, unscored = self._collect_checkpoint_scores()
@@ -1036,6 +1085,8 @@ class AuxTrainer(Trainer):
         }
         with summary_path.open("w", encoding="utf-8") as handle:
             json.dump(summary, handle, indent=2)
+        if distributed:
+            torch.distributed.barrier()
 
     def _maybe_log_save_evaluate(
         self,
@@ -1659,6 +1710,13 @@ if __name__ == "__main__":
             "No CUDA GPU is visible in the current environment. "
             "Use a GPU-enabled environment to run auxiliary GR00T training."
         )
-    if config.num_gpus > 1 and available_gpus > 1 and os.environ.get("IS_TORCHRUN", "0") != "1":
-        raise NotImplementedError("Multi-GPU launch is not wired for the auxiliary trainer yet. Start with num_gpus=1.")
+    launched_distributed = any(
+        os.environ.get(name)
+        for name in ("LOCAL_RANK", "RANK", "WORLD_SIZE", "IS_TORCHRUN")
+    )
+    if config.num_gpus > 1 and available_gpus > 1 and not launched_distributed:
+        raise RuntimeError(
+            "Multi-GPU auxiliary training must be launched with torchrun, for example: "
+            "`torchrun --standalone --nproc_per_node=4 ...`."
+        )
     main(config)
