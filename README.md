@@ -144,7 +144,7 @@ train_benefit_adapter.py 是保守版本：比较带子任务条件的 DiT 与�
 
 scripts/ur3e_robocasa_eval 下的代码属于早期 Franka 到 UR3e 的仿真轨迹映射实验，与当前子任务 embedding + XR-1 AdaLN adapter 方法无关，可以忽略。
 
-  ## 常用入口
+## 常用入口
 
     python -m scripts.long_horizon_controller.run_composite_seen_eval --model-path <checkpoint> --aux-head-path <aux-checkpoint> --output-root <output-dir>
 
