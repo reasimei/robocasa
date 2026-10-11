@@ -392,7 +392,7 @@ def run_one_episode(
                     cooldown_steps=args.cooldown_steps,
                 )
             ),
-            aux_fusion=AuxHeadFusionMonitor(
+            aux_fusion=None if args.disable_aux_head else AuxHeadFusionMonitor(
                 retry_confidence_threshold=args.aux_retry_confidence_threshold,
                 success_confidence_threshold=args.aux_success_confidence_threshold,
                 cooldown_steps=args.aux_cooldown_steps,
@@ -408,6 +408,8 @@ def run_one_episode(
                 save_vlm_frames=args.save_vlm_frames,
                 max_rollback_chunks=args.max_rollback_chunks,
                 policy_language_mode=args.policy_language_mode,
+                fixed_vlm_interval_steps=args.vlm_fixed_interval_steps,
+                fast_only=args.fast_only,
             ),
         )
         controller.run()
@@ -581,6 +583,7 @@ def parse_args() -> argparse.Namespace:
         help="Base VLA implementation used by the long-horizon controller.",
     )
     parser.add_argument("--aux-head-path", default=AUX_HEAD_PATH)
+    parser.add_argument("--disable-aux-head", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--xiaomi-aux-head-path",
         default="",
@@ -687,6 +690,8 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="Minimum executed control steps before the auxiliary head may trigger the VLM.",
     )
+    parser.add_argument("--vlm-fixed-interval-steps", type=int, default=0)
+    parser.add_argument("--fast-only", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--annotate-videos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--progress",
@@ -777,7 +782,7 @@ def main() -> None:
         policy_adapter = Gr00tPolicyAdapter(
             policy=policy,
             action_keys=modality_config["action"].modality_keys,
-            aux_head_path=args.aux_head_path,
+            aux_head_path="" if args.disable_aux_head else args.aux_head_path,
         )
     rows: list[dict[str, Any]] = []
     task_progress = tqdm(

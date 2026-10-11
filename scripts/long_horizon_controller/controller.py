@@ -35,6 +35,8 @@ class ControllerConfig:
     save_vlm_frames: bool = False
     max_rollback_chunks: int = 8
     policy_language_mode: str = "full_task_and_subtask"
+    fixed_vlm_interval_steps: int = 0
+    fast_only: bool = False
 
 
 @dataclass
@@ -390,8 +392,18 @@ class LongHorizonController:
                 if self.aux_fusion is not None:
                     fast_signal = self.aux_fusion.fuse(fast_signal, aux_output)
 
-                if fast_signal.trigger != FastTrigger.NONE:
+                fixed_vlm_trigger = (
+                    self.config.fixed_vlm_interval_steps > 0
+                    and local_step % self.config.fixed_vlm_interval_steps == 0
+                )
+                trigger_for_vlm = fast_signal.trigger != FastTrigger.NONE or fixed_vlm_trigger
+                if trigger_for_vlm:
                     fast_trigger_count += 1
+                    if fixed_vlm_trigger and fast_signal.trigger == FastTrigger.NONE:
+                        fast_signal.reason = (
+                            f"fixed interval: local_step={local_step}; "
+                            f"interval={self.config.fixed_vlm_interval_steps}"
+                        )
                     self.log_event(
                         global_step,
                         current_index,
@@ -399,6 +411,14 @@ class LongHorizonController:
                         "fast_signal",
                         asdict(fast_signal),
                     )
+                    if self.config.fast_only:
+                        self.completed.append(subtask)
+                        self.log_event(
+                            global_step, current_index, subtask, "fast_only_advance",
+                            {"reason": fast_signal.reason, "aux_state": fast_signal.aux_state},
+                        )
+                        current_index += 1
+                        break
                     next_subtask = self.queue[0] if self.queue else None
                     current_image = self._snapshot_vlm_image(
                         self.env.get_vlm_image(observation)
